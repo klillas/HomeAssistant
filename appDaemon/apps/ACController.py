@@ -2,6 +2,7 @@ import appdaemon.plugins.hass.hassapi as hass
 from datetime import datetime, timedelta
 import time
 
+
 #
 # AC Controller app
 #
@@ -10,8 +11,8 @@ import time
 
 class ACController(hass.Hass):
   target_room_min_temperature = 18    # Minimum room temperature, always turn on AC even during high prices if we go under this
-  target_room_temperature     = 27    # Ideal room temperature, try to reach this target under ideal pricing circumstances
-  target_room_max_temperature = 30    # Maximum allowed room temperature, do not try to collect more heat even if price is low
+  target_room_temperature     = 25    # Ideal room temperature, try to reach this target under ideal pricing circumstances
+  target_room_max_temperature = 28    # Maximum allowed room temperature, do not try to collect more heat even if price is low
 
   min_mean_price_multiplier = 0.5     # If the current price is lower than this mean multiplier, recommend running AC fulltime
   max_mean_price_multiplier = 1.5     # If the current price is higher than this mean multiplier, recommend shutting down AC
@@ -19,10 +20,13 @@ class ACController(hass.Hass):
   min_absolute_price        = 5.0     # If the current price is lower than this absolute price, recommend running AC fulltime
   max_absolute_price        = 30.0    # If the current price is higher than this absolute price, recommend shutting down AC
 
-  min_state_change_time         = 1800    # Amount of seconds before another state change is allowed to reduce oscillating behavior
-  ignore_change_time_temp_diff  = 2       # We ignore the waiting time between state changes if the temp diff between current room temp
-                                          # and target temp is too large
-                                          # This can happens when the price changes radically from one hour to the next
+  min_state_change_time         = 1800      # Amount of seconds before another state change is allowed to reduce oscillating behavior
+  ignore_change_time_temp_diff  = 2         # We ignore the waiting time between state changes if the temp diff between current room temp
+                                            # and target temp is too large
+                                            # This can happens when the price changes radically from one hour to the next
+  
+  day_transfer_charge           = 3.87      # Grid transfer cost in cent/kWh from 07 - 22
+  night_transfer_charge         = 1.31      # Grid transfer cost in cent/kWh from 22 - 07
 
   entity_id_climate_control = "climate.153931628243065_climate"
   entity_id_weather_forecast = "weather.forecast_home"
@@ -96,10 +100,10 @@ class ACController(hass.Hass):
     for i in range(len(hourly_prices)):
       if ( (i % 24) >= 22 or (i % 24) < 7):
         # Night transfer charge
-        hourly_prices[i] = hourly_prices[i] + 1.31
+        hourly_prices[i] = hourly_prices[i] + self.night_transfer_charge
       else:
         # Day transfer charge
-        hourly_prices[i] = hourly_prices[i] + 3.87
+        hourly_prices[i] = hourly_prices[i] + self.day_transfer_charge
       # Safety in case once in a blue moon we get negative prices
       # Setting it to 0 will avoid any strange calculations later on
       # This will have minimal effect in practice and will almost never be applied
@@ -127,7 +131,7 @@ class ACController(hass.Hass):
     if (price_now < 0):
       price_now = 0
     self.log(f"Price now: {price_now}, Mean price {mean_price}")
-    # self.log(f"Today+tomorrow full prices {len(hourly_prices)} items: {hourly_prices}")
+    self.log(f"Today+tomorrow full prices {len(hourly_prices)} items: {hourly_prices}")
 
     if (inside_temperature < self.target_room_min_temperature):
       return self.target_room_min_temperature
@@ -170,10 +174,11 @@ class ACController(hass.Hass):
     ac_fan_mode = self.get_state(self.entity_id_climate_control, attribute="fan_mode")
     ac_swing_mode = self.get_state(self.entity_id_climate_control, attribute="swing_mode")
     ac_current_target_temperature = self.get_state(self.entity_id_climate_control, attribute="temperature")
+    ac_prompt_tone = self.get_state(self.entity_id_climate_control, attribute="prompt_tone")
     # Round to closest half degree
     target_temperature = round(target_temperature * 2) / 2
     # self.log(f"AC state: {ac_state}")
-
+    
     self.log(f"Room temp: {inside_temperature}, Target temp: {target_temperature}, AC temp: {ac_current_target_temperature}")
     self.log(f"Time since last state change: {datetime.now() - self.last_state_change_time}")
 
@@ -181,12 +186,20 @@ class ACController(hass.Hass):
       if ( (abs(inside_temperature - target_temperature)) < self.ignore_change_time_temp_diff ):
         # Not yet time for a scheduled state change and the temperature deviation is not large enough, don't do anything
         return
+
     if (inside_temperature >= target_temperature):
       # Make sure AC is shut down
-      if (ac_power == True):
-        self.log(f"Turn off AC");
+      if (ac_state != "fan_only"):
+        self.log(f"Turn off AC - Use fan only mode");
         self.last_state_change_time = datetime.now()
-        self.call_service("climate/turn_off", entity_id=self.entity_id_climate_control)
+        self.call_service("climate/set_hvac_mode", entity_id=self.entity_id_climate_control, hvac_mode="fan_only")
+        time.sleep(2)
+
+      if (ac_fan_mode != "Silent"):
+        self.log(f"Set fan to silent")
+        self.call_service("climate/set_fan_mode", entity_id=self.entity_id_climate_control, fan_mode="Silent")
+        time.sleep(2)
+
     else:
       # Make sure AC is running and has the correct target temperatures
       if (ac_power == False):
