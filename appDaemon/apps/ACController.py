@@ -11,8 +11,8 @@ import time
 
 class ACController(hass.Hass):
   target_room_min_temperature = 18    # Minimum room temperature, always turn on AC even during high prices if we go under this
-  target_room_temperature     = 25    # Ideal room temperature, try to reach this target under ideal pricing circumstances
-  target_room_max_temperature = 28    # Maximum allowed room temperature, do not try to collect more heat even if price is low
+  target_room_temperature     = 23    # Ideal room temperature, try to reach this target under ideal pricing circumstances
+  target_room_max_temperature = 24    # Maximum allowed room temperature, do not try to collect more heat even if price is low
 
   min_mean_price_multiplier = 0.5     # If the current price is lower than this mean multiplier, recommend running AC fulltime
   max_mean_price_multiplier = 1.5     # If the current price is higher than this mean multiplier, recommend shutting down AC
@@ -27,6 +27,8 @@ class ACController(hass.Hass):
   
   day_transfer_charge           = 3.87      # Grid transfer cost in cent/kWh from 07 - 22
   night_transfer_charge         = 1.31      # Grid transfer cost in cent/kWh from 22 - 07
+
+  state_update_timer            = 60        # How many seconds between two state updates
 
   entity_id_climate_control = "climate.153931628243065_climate"
   entity_id_weather_forecast = "weather.forecast_home"
@@ -51,8 +53,8 @@ class ACController(hass.Hass):
     # Define the starting time
     # now = datetime.datetime.now()
 
-    # Schedule the function to run every 5 seconds
-    self.run_every(self.control_climate, "now", 5)
+    # Schedule the function to run every state_update_timer seconds
+    self.run_every(self.control_climate, "now", self.state_update_timer)
 
 
   def normalize_value(self, value_now, max_value, min_value):
@@ -175,14 +177,12 @@ class ACController(hass.Hass):
     ac_swing_mode = self.get_state(self.entity_id_climate_control, attribute="swing_mode")
     ac_current_target_temperature = self.get_state(self.entity_id_climate_control, attribute="temperature")
     ac_prompt_tone = self.get_state(self.entity_id_climate_control, attribute="prompt_tone")
-    # Round to closest half degree
-    target_temperature = round(target_temperature * 2) / 2
     # self.log(f"AC state: {ac_state}")
     
     self.log(f"Room temp: {inside_temperature}, Target temp: {target_temperature}, AC temp: {ac_current_target_temperature}")
     self.log(f"Time since last state change: {datetime.now() - self.last_state_change_time}")
 
-    if ( (datetime.now() - self.last_state_change_time) < timedelta(seconds=3) ):
+    if ( (datetime.now() - self.last_state_change_time) < timedelta(seconds=self.min_state_change_time) ):
       if ( (abs(inside_temperature - target_temperature)) < self.ignore_change_time_temp_diff ):
         # Not yet time for a scheduled state change and the temperature deviation is not large enough, don't do anything
         return
@@ -233,18 +233,44 @@ class ACController(hass.Hass):
         time.sleep(2)
 
 
+  def update_custom_sensors(self, target_temperature):
+    # Update or create a custom sensor to store this data
+    current_hour = datetime.now().hour
+    hourly_prices = self.calculate_hourly_prices()
+    price_now = hourly_prices[current_hour]
+    
+    ac_state = self.get_state(self.entity_id_climate_control, attribute="state")
+    ac_on_off_state = 0
+    self.log(f"Add state to history: {ac_state}")
+    if (ac_state == "heat"):
+      ac_on_off_state = 1
+    self.set_state("sensor.ac_on_off_history", state=ac_on_off_state, attributes={
+        "unit_of_measurement": "",
+        "friendly_name": "AC activity history"
+    })
+
+    self.set_state("sensor.ac_target_temperature_history", state=target_temperature, attributes={
+        "unit_of_measurement": "C",
+        "friendly_name": "AC target temp history"
+    })
+
+    self.set_state("sensor.electricity_price", state=price_now, attributes={
+        "unit_of_measurement": "c/kWh",
+        "friendly_name": "Electricity price history"
+    })
+
+
+
+
   def control_climate(self, kwargs):
     # 
     # self.call_service("climate/set_temperature", entity_id="climate.153931628243065_climate", temperature=21)
     # self.log("AC control updated")
     self.log(f"")
     target_temperature = self.calculate_target_temperature()
+    # Round to closest half degree
+    target_temperature = round(target_temperature * 2) / 2
+
     self.control_AC(target_temperature)
+    self.update_custom_sensors(target_temperature)
   
-    
-
-
-      
-
-
-
