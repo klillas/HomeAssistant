@@ -30,13 +30,14 @@ class ACController(hass.Hass):
 
   state_update_timer            = 5        # How many seconds between two state updates
 
-  #manual_override_end_time      = datetime.now()  # Defines when manual override will stop
+  manual_override_end_time      = datetime.now()  # Defines when manual override will stop
   #manual_override_target_temp   = 23              # What temperature to set when manual override is active
 
 
   entity_id_climate_control = "climate.153931628243065_climate"
   entity_id_weather_forecast = "weather.forecast_home"
   entity_id_nordpool_sensor  = "sensor.nordpool_kwh_fi_eur_3_10_024"
+  entity_id_room_temperature = "sensor.grovkok_golv_temperature"
 
 
   target_room_min_temperature_id = "input_number.target_room_min_temperature"
@@ -55,7 +56,8 @@ class ACController(hass.Hass):
   day_transfer_charge_id = "input_number.day_transfer_charge"
   night_transfer_charge_id = "input_number.night_transfer_charge"
 
-  #manual_override_end_time_id = "input_datetime.manual_override_end_time"
+  manual_override_set_id = "input_boolean.manual_override_set"
+
 
   # TODO: AC energy multiplier curve based on outside and inside temp difference. AC is more effective during hours when outside temp
   #       is higher, which can be used to make a better price estimation when we move from pure electricity pricing calculation to
@@ -119,6 +121,16 @@ class ACController(hass.Hass):
       # Entity exists, don't overwrite it
       #self.log(f"{entity_id} already exists with value {entity_state}")
 
+  def create_input_boolean(self, entity_id, name, initial_state):
+    # Check if the entity already exists
+    entity_state = self.get_state(entity_id)
+
+    if entity_state is None:
+      # Entity doesn't exist, so create it with the initial state
+      self.log(f"Creating {entity_id} with initial state {initial_state}")
+      self.set_state(entity_id, state=initial_state, attributes={"friendly_name": name})
+
+
   def initialize_all_parameters(self):
     # Dynamically create or set default values for input_number entities only if they don't exist
     # self.log(f"Update all parameters")
@@ -137,6 +149,8 @@ class ACController(hass.Hass):
     
     self.create_input_number(self.day_transfer_charge_id, "Electricity Grid Day Transfer Charge", 3.87, 0.0, 10.0, 0.1)
     self.create_input_number(self.night_transfer_charge_id, "Electricity Grid Night Transfer Charge", 1.31, 0.0, 10.0, 0.1)
+
+    self.create_input_boolean(self.manual_override_set_id, "AC manual override set", "off")
 
     # self.create_input_date(self.manual_override_end_time_id, "Manual control end time")
 
@@ -161,6 +175,8 @@ class ACController(hass.Hass):
     
     self.listen_state(self.input_number_changed, self.day_transfer_charge_id)
     self.listen_state(self.input_number_changed, self.night_transfer_charge_id)
+
+    self.listen_state(self.input_boolean_changed, self.manual_override_set_id)
 
     # self.listen_state(self.input_datetime_changed, self.manual_override_end_time_id)
 
@@ -244,6 +260,18 @@ class ACController(hass.Hass):
       # Allow immediate AC state update
       self.last_state_change_time = datetime.now() - timedelta(seconds=self.min_state_change_time+1)
 
+
+  def input_boolean_changed(self, entity, attribute, old, new, kwargs):
+      # Log whenever an input_number value changes
+      self.log(f"{entity} changed from {old} to {new}")
+      
+      # Update the internal values after the change
+      self.update_internal_parameters()
+
+      # Allow immediate AC state update
+      self.last_state_change_time = datetime.now() - timedelta(seconds=self.min_state_change_time+1)
+
+
   def input_datetime_changed(self, entity, attribute, old, new, kwargs):
       # Log whenever an input_datetime value changes
       self.log(f"{entity} changed from {old} to {new}")
@@ -318,7 +346,8 @@ class ACController(hass.Hass):
 
   # Calculates the target temperature for this hour based on readings and price
   def calculate_target_temperature(self):
-    inside_temperature = self.get_state(self.entity_id_climate_control, attribute="current_temperature")
+    inside_temperature = self.get_state(self.entity_id_room_temperature, attribute="state")
+    inside_temperature = float(inside_temperature)
 
     current_hour = datetime.now().hour
     hourly_prices = self.calculate_hourly_prices()
@@ -365,7 +394,8 @@ class ACController(hass.Hass):
   
 
   def control_AC(self, target_temperature):
-    inside_temperature = self.get_state(self.entity_id_climate_control, attribute="current_temperature")
+    inside_temperature = self.get_state(self.entity_id_room_temperature, attribute="state")
+    inside_temperature = float(inside_temperature)
     ac_power = self.get_state(self.entity_id_climate_control, attribute="power")
     ac_mode = self.get_state(self.entity_id_climate_control, attribute="power")
     ac_state = self.get_state(self.entity_id_climate_control, attribute="state")
