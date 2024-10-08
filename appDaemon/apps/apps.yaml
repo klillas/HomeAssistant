@@ -2,3 +2,7 @@
 ac_control_app:
   module: ACController
   class: ACController
+
+energy_calculations_app:
+  module: EnergyCalculations
+  class: EnergyCalculations

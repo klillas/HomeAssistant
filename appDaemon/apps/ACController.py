@@ -24,20 +24,19 @@ class ACController(hass.Hass):
   ignore_change_time_temp_diff  = 2         # We ignore the waiting time between state changes if the temp diff between current room temp
                                             # and target temp is too large
                                             # This can happens when the price changes radically from one hour to the next
-  
-  day_transfer_charge           = 3.87      # Grid transfer cost in cent/kWh from 07 - 22
-  night_transfer_charge         = 1.31      # Grid transfer cost in cent/kWh from 22 - 07
 
   state_update_timer            = 5        # How many seconds between two state updates
 
   manual_override_end_time      = datetime.now()  # Defines when manual override will stop
   #manual_override_target_temp   = 23              # What temperature to set when manual override is active
 
+  # Updated in EnergyCalculations.py
+  absolute_electricity_price_c_kWh_id = "sensor.electricity_price"
+  electricity_price_mean_c_kWh_id = "sensor.electricity_price_mean_c_kWh"
 
   entity_id_climate_control = "climate.153931628243065_climate"
   entity_id_weather_forecast = "weather.forecast_home"
-  entity_id_nordpool_sensor  = "sensor.nordpool_kwh_fi_eur_3_10_024"
-  entity_id_room_temperature = "sensor.grovkok_golv_temperature"
+  entity_id_room_temperature = "sensor.climate_living_room_temperature"
 
 
   target_room_min_temperature_id = "input_number.target_room_min_temperature"
@@ -52,9 +51,6 @@ class ACController(hass.Hass):
   
   min_state_change_time_id = "input_number.min_state_change_time"
   ignore_change_time_temp_diff_id = "input_number.ignore_change_time_temp_diff"
-  
-  day_transfer_charge_id = "input_number.day_transfer_charge"
-  night_transfer_charge_id = "input_number.night_transfer_charge"
 
   manual_override_set_id = "input_boolean.manual_override_set"
 
@@ -77,11 +73,15 @@ class ACController(hass.Hass):
     self.initialize_all_parameters()
     self.update_internal_parameters()
 
-    # Define the starting time
-    # now = datetime.datetime.now()
+    # Calculate the next time to run the function, 1 second past the next full minute
+    now = datetime.now()
+    next_minute = now + timedelta(minutes=1)
+    start_time = next_minute.replace(second=2, microsecond=0)
 
     # Schedule the function to run every state_update_timer seconds
-    self.run_every(self.control_climate, "now", self.state_update_timer)
+    # self.run_every(self.control_climate, "now", self.state_update_timer)
+    self.run_minutely(self.control_climate, start=start_time)
+    
 
   def create_input_date(self, entity_id, name):
     # Check if the entity already exists
@@ -100,6 +100,18 @@ class ACController(hass.Hass):
           "second": now.second,
           "friendly_name": name
       })
+
+  def create_numeric_entity(self, entity_id, name, initial_value, unit_of_measurement):
+      # Check if the entity already exists
+      entity_state = self.get_state(entity_id)
+      
+      if entity_state is None:
+          # Entity doesn't exist, so create it with the initial value
+          self.log(f"Creating {entity_id} with initial value {initial_value}")
+          self.set_state(entity_id, state=initial_value, attributes={
+              "unit_of_measurement": unit_of_measurement,
+              "friendly_name": name
+          })
 
   def create_input_number(self, entity_id, name, initial, min_value, max_value, step):
     # Check if the entity already exists
@@ -146,9 +158,6 @@ class ACController(hass.Hass):
     
     self.create_input_number(self.min_state_change_time_id, "Min State Change Time (sec)", 1800, 0, 3600, 60)
     self.create_input_number(self.ignore_change_time_temp_diff_id, "Temp Diff to Ignore Time", 2, 0, 10, 0.5)
-    
-    self.create_input_number(self.day_transfer_charge_id, "Electricity Grid Day Transfer Charge", 3.87, 0.0, 10.0, 0.1)
-    self.create_input_number(self.night_transfer_charge_id, "Electricity Grid Night Transfer Charge", 1.31, 0.0, 10.0, 0.1)
 
     self.create_input_boolean(self.manual_override_set_id, "AC manual override set", "off")
 
@@ -172,9 +181,6 @@ class ACController(hass.Hass):
     
     self.listen_state(self.input_number_changed, self.min_state_change_time_id)
     self.listen_state(self.input_number_changed, self.ignore_change_time_temp_diff_id)
-    
-    self.listen_state(self.input_number_changed, self.day_transfer_charge_id)
-    self.listen_state(self.input_number_changed, self.night_transfer_charge_id)
 
     self.listen_state(self.input_boolean_changed, self.manual_override_set_id)
 
@@ -196,8 +202,6 @@ class ACController(hass.Hass):
     self.min_state_change_time = int(self.get_state(self.min_state_change_time_id))
     self.ignore_change_time_temp_diff = float(self.get_state(self.ignore_change_time_temp_diff_id))
 
-    self.day_transfer_charge = float(self.get_state(self.day_transfer_charge_id))
-    self.night_transfer_charge = float(self.get_state(self.night_transfer_charge_id))
 
   def change_state(self,event_name,data, kwargs):
     entity_id = data["service_data"]["entity_id"]
@@ -231,12 +235,6 @@ class ACController(hass.Hass):
         
     elif entity_id == self.ignore_change_time_temp_diff_id:
         self.set_state(self.ignore_change_time_temp_diff_id, state=new_value)
-        
-    elif entity_id == self.day_transfer_charge_id:
-        self.set_state(self.day_transfer_charge_id, state=new_value)
-        
-    elif entity_id == self.night_transfer_charge_id:
-        self.set_state(self.night_transfer_charge_id, state=new_value)
 
     #elif entity_id == self.manual_override_end_time_id:
     #    new_time = data["service_data"].get("time")
@@ -295,66 +293,16 @@ class ACController(hass.Hass):
     return normalized_value
 
 
-  def calculate_mean_value(self, item_list):
-    # Calculate the mean value of the hourly prices
-    if item_list:  # Check if the list is not empty
-      mean_value = sum(item_list) / len(item_list)
-    else:
-      mean_value = 0  # or handle empty list case appropriately
-    mean_value = round(mean_value, 1)
-    return mean_value
-
-
-  def calculate_hourly_prices(self):
-    today = self.get_state(self.entity_id_nordpool_sensor, attribute="today")
-    tomorrow_valid = self.get_state(self.entity_id_nordpool_sensor, attribute="tomorrow_valid")
-    tomorrow = self.get_state(self.entity_id_nordpool_sensor, attribute="tomorrow")
-    if (tomorrow_valid == True):
-      hourly_prices = today + tomorrow
-    else:
-      # Hacky solution to allow calculations any time of the day, even when tomorrow is not available
-      # Will probably yield acceptable results for the morning/early day, but can be way off in afternoon/evening
-      # The hope is that the next day pricing will have arrived by then
-      # self.log(f"No price for tomorrow, using todays prices as estimation for tomorrow")
-      hourly_prices = today + today
-
-    # self.log(f"Today+tomorrow base prices {len(hourly_prices)} items: {hourly_prices}")
-
-    # Add the Vaasa Elektriska fixed transfer charge
-    for i in range(len(hourly_prices)):
-      hourly_prices[i] = hourly_prices[i] + 0.41
-
-    # Add the night / day transfer charge
-    for i in range(len(hourly_prices)):
-      if ( (i % 24) >= 22 or (i % 24) < 7):
-        # Night transfer charge
-        hourly_prices[i] = hourly_prices[i] + self.night_transfer_charge
-      else:
-        # Day transfer charge
-        hourly_prices[i] = hourly_prices[i] + self.day_transfer_charge
-      # Safety in case once in a blue moon we get negative prices
-      # Setting it to 0 will avoid any strange calculations later on
-      # This will have minimal effect in practice and will almost never be applied
-      if (hourly_prices[i] < 0):
-        hourly_prices[i] = 0
-
-    # Round each price to one decimal place
-    hourly_prices = [round(price, 1) for price in hourly_prices]
-
-    return hourly_prices
-
-
   # Calculates the target temperature for this hour based on readings and price
   def calculate_target_temperature(self):
     inside_temperature = self.get_state(self.entity_id_room_temperature, attribute="state")
     inside_temperature = float(inside_temperature)
 
-    current_hour = datetime.now().hour
-    hourly_prices = self.calculate_hourly_prices()
-    mean_price = self.calculate_mean_value(hourly_prices)
+    mean_price = float(self.get_state(self.electricity_price_mean_c_kWh_id))
     mean_price_min = mean_price * self.min_mean_price_multiplier
     mean_price_max = mean_price * self.max_mean_price_multiplier
-    price_now = hourly_prices[current_hour]
+    price_now = float(self.get_state(self.absolute_electricity_price_c_kWh_id))
+
     if (price_now < 0):
       price_now = 0
     self.log(f"Price now: {price_now}, Mean price {mean_price}")
@@ -461,10 +409,6 @@ class ACController(hass.Hass):
 
   def update_custom_sensors(self, target_temperature):
     # Update or create a custom sensor to store this data
-    current_hour = datetime.now().hour
-    hourly_prices = self.calculate_hourly_prices()
-    price_now = hourly_prices[current_hour]
-    
     ac_state = self.get_state(self.entity_id_climate_control, attribute="state")
     ac_on_off_state = 0
     self.log(f"Add state to history: {ac_state}")
@@ -478,11 +422,6 @@ class ACController(hass.Hass):
     self.set_state("sensor.ac_target_temperature_history", state=target_temperature, attributes={
         "unit_of_measurement": "C",
         "friendly_name": "AC target temp history"
-    })
-
-    self.set_state("sensor.electricity_price", state=price_now, attributes={
-        "unit_of_measurement": "c/kWh",
-        "friendly_name": "Electricity price history"
     })
 
 
