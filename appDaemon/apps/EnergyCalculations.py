@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 class EnergyCalculations(hass.Hass):
    vaasa_elektriska_monthly_cost   = 4.00    # Vaasa elektriska monthly subscription cost in euro
-   electric_grid_monthly_cost      = 52.11   # Electric grid connection monthly cost in euro
+   electric_grid_monthly_cost      = 27.37   # Electric grid connection monthly cost in euro
 
    day_transfer_charge           = 3.87      # Grid transfer cost in cent/kWh from 07 - 22
    night_transfer_charge         = 1.31      # Grid transfer cost in cent/kWh from 22 - 07
@@ -16,7 +16,7 @@ class EnergyCalculations(hass.Hass):
    update_interval_minutes = 1               # How often the energy calculations will be updated
 
    entity_id_running_energy_costs = "sensor.running_energy_costs"
-   entity_id_nordpool_sensor  = "sensor.nordpool_kwh_fi_eur_3_10_024"
+   entity_id_nordpool_sensor  = "sensor.nordpool_kwh_fi_eur_3_10_0255"
 
    day_transfer_charge_id = "input_number.day_transfer_charge"
    night_transfer_charge_id = "input_number.night_transfer_charge"
@@ -29,8 +29,10 @@ class EnergyCalculations(hass.Hass):
    def initialize(self):
       # Calculate the next time to run the function, 1 second past the next full minute
       now = datetime.now()
-      next_minute = now + timedelta(minutes=1)
-      start_time = next_minute.replace(second=1, microsecond=0)
+      # next_minute = now + timedelta(minutes=1)
+      #start_time = next_minute.replace(second=1, microsecond=0)
+      next_minute = now + timedelta(seconds=3)
+      start_time = next_minute
 
       self.initialize_all_parameters()
 
@@ -184,70 +186,83 @@ class EnergyCalculations(hass.Hass):
 
 
    def update_energy_price(self):
-    current_hour = datetime.now().hour
-    hourly_prices = self.calculate_hourly_prices()
-    price_now = hourly_prices[current_hour]
-    mean_price = self.calculate_mean_value(hourly_prices)
+      now = datetime.now()
+      current_index = now.hour * 4 + now.minute // 15
+      fifteen_minute_prices = self.calculate_fifteen_minute_prices()
+      price_now = fifteen_minute_prices[current_index]
+      mean_price = self.calculate_mean_value(fifteen_minute_prices)
 
-    self.set_state(self.absolute_electricity_price_c_kWh_id, state=price_now, attributes={
-        "unit_of_measurement": "c/kWh",
-        "friendly_name": "Electricity price history"
-    })
+      self.set_state(self.absolute_electricity_price_c_kWh_id, state=price_now, attributes={
+         "unit_of_measurement": "c/kWh",
+         "friendly_name": "Electricity price history"
+      })
 
-    self.set_state(self.absolute_electricity_price_E_kWh_id, state=price_now/100, attributes={
-        "unit_of_measurement": "E/kWh",
-        "friendly_name": "Electricity price history Euro/kWh"
-    })
+      self.set_state(self.absolute_electricity_price_E_kWh_id, state=price_now/100, attributes={
+         "unit_of_measurement": "E/kWh",
+         "friendly_name": "Electricity price history Euro/kWh"
+      })
 
-    self.set_state(self.mean_electricity_price_c_kWh_id, state=mean_price, attributes={
-        "unit_of_measurement": "c/kWh",
-        "friendly_name": "Electricity price mean history Cent/kWh"
-    })
+      self.set_state(self.mean_electricity_price_c_kWh_id, state=mean_price, attributes={
+         "unit_of_measurement": "c/kWh",
+         "friendly_name": "Electricity price mean history Cent/kWh"
+      })
 
 
-   def calculate_hourly_prices(self):
+   def calculate_fifteen_minute_prices(self):
       today = self.get_state(self.entity_id_nordpool_sensor, attribute="today")
+      if len(today) < 96:
+         self.log(f"Padding today prices, NOTICE: THIS MIGHT BE HIDING A BUG")
+         missing = 96 - len(today)
+         today = [today[0]] * missing + today
+
       tomorrow_valid = self.get_state(self.entity_id_nordpool_sensor, attribute="tomorrow_valid")
-      tomorrow = self.get_state(self.entity_id_nordpool_sensor, attribute="tomorrow")
       if (tomorrow_valid == True):
-         hourly_prices = today + tomorrow
+         tomorrow = self.get_state(self.entity_id_nordpool_sensor, attribute="tomorrow")
+         if len(tomorrow) < 96:
+            self.log(f"Padding tomorrow prices, NOTICE: THIS MIGHT BE HIDING A BUG")
+            missing = 96 - len(tomorrow)
+            tomorrow = [tomorrow[0]] * missing + tomorrow
+         fifteen_minute_prices = today + tomorrow
       else:
          # Hacky solution to allow calculations any time of the day, even when tomorrow is not available
          # Will probably yield acceptable results for the morning/early day, but can be way off in afternoon/evening
          # The hope is that the next day pricing will have arrived by then
          # self.log(f"No price for tomorrow, using todays prices as estimation for tomorrow")
-         hourly_prices = today + today
+         fifteen_minute_prices = today + today
 
-      # self.log(f"Today+tomorrow base prices {len(hourly_prices)} items: {hourly_prices}")
+      self.log(f"Today+tomorrow base prices {len(fifteen_minute_prices)} items: {fifteen_minute_prices}")
 
       # Add the Vaasa Elektriska fixed transfer charge
-      for i in range(len(hourly_prices)):
-         hourly_prices[i] = hourly_prices[i] + self.vaasa_elektriska_transfer_charge
+      for i in range(len(fifteen_minute_prices)):
+         fifteen_minute_prices[i] = fifteen_minute_prices[i] + self.vaasa_elektriska_transfer_charge
 
       # Add the electricity tax
-      #for i in range(len(hourly_prices)):
-      #   hourly_prices[i] = hourly_prices[i] + self.electricity_tax
+      for i in range(len(fifteen_minute_prices)):
+         fifteen_minute_prices[i] = fifteen_minute_prices[i] + self.electricity_tax
 
       # Add the night / day grid transfer charge
-      for i in range(len(hourly_prices)):
-         if ( (i % 24) >= 22 or (i % 24) < 7):
+      for i in range(len(fifteen_minute_prices)):
+         hour = (i % 96) // 4   # Convert 15-min index to hour (0–23)
+         
+         if hour >= 22 or hour < 7:
             # Night transfer charge
-            hourly_prices[i] = hourly_prices[i] + self.night_transfer_charge
+            fifteen_minute_prices[i] = fifteen_minute_prices[i] + self.night_transfer_charge
          else:
             # Day transfer charge
-            hourly_prices[i] = hourly_prices[i] + self.day_transfer_charge
+            fifteen_minute_prices[i] = fifteen_minute_prices[i] + self.day_transfer_charge
 
-      for i in range(len(hourly_prices)):
+
+      for i in range(len(fifteen_minute_prices)):
          # Safety in case once in a blue moon we get negative prices
          # Setting it to 0 will avoid any strange calculations later on
          # This will have minimal effect in practice and will almost never be applied
-         if (hourly_prices[i] < 0):
-            hourly_prices[i] = 0
+         if (fifteen_minute_prices[i] < 0):
+            fifteen_minute_prices[i] = 0
 
       # Round each price to one decimal place
-      hourly_prices = [round(price, 1) for price in hourly_prices]
+      fifteen_minute_prices = [round(price, 1) for price in fifteen_minute_prices]
 
-      return hourly_prices
+      return fifteen_minute_prices
    
 
    def calculate_mean_value(self, item_list):
