@@ -29,10 +29,8 @@ class EnergyCalculations(hass.Hass):
    def initialize(self):
       # Calculate the next time to run the function, 1 second past the next full minute
       now = datetime.now()
-      # next_minute = now + timedelta(minutes=1)
-      #start_time = next_minute.replace(second=1, microsecond=0)
-      next_minute = now + timedelta(seconds=3)
-      start_time = next_minute
+      next_minute = now + timedelta(minutes=1)
+      start_time = next_minute.replace(second=1, microsecond=0)
 
       self.initialize_all_parameters()
 
@@ -295,3 +293,4 @@ class EnergyCalculations(hass.Hass):
       minutes_in_month = days_in_month * minutes_per_day
 
       return minutes_in_month
+
