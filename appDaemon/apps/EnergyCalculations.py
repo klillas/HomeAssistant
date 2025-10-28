@@ -32,22 +32,15 @@ class EnergyCalculations(hass.Hass):
       next_minute = now + timedelta(minutes=1)
       start_time = next_minute.replace(second=1, microsecond=0)
 
-      self.initialize_all_parameters()
+      self.update_internal_parameters()
 
       # Schedule the function to run at 1 second past every new minute
-      # self.run_every(self.main_update_routine, "now", 1)
       self.run_every(self.main_update_routine, start_time, self.update_interval_minutes * 60)
-      # self.run_minutely(self.main_update_routine, start=start_time)
 
 
    def initialize_all_parameters(self):
-      # Dynamically create or set default values for input_number entities only if they don't exist
-      self.create_input_number(self.day_transfer_charge_id, "Electricity Grid Day Transfer Charge", 3.87, 0.0, 10.0, 0.1)
-      self.create_input_number(self.night_transfer_charge_id, "Electricity Grid Night Transfer Charge", 1.31, 0.0, 10.0, 0.1)
-
-      self.listen_event(self.change_state, event = "call_service")
-
       # Set up state listeners (callbacks) for when these values change
+      self.listen_event(self.change_state, event="call_service")
       self.listen_state(self.input_number_changed, self.day_transfer_charge_id)
       self.listen_state(self.input_number_changed, self.night_transfer_charge_id)
 
@@ -78,27 +71,6 @@ class EnergyCalculations(hass.Hass):
 
       # Allow immediate AC state update
       self.last_state_change_time = datetime.now() - timedelta(seconds=self.min_state_change_time+1)
-
-
-   def create_input_number(self, entity_id, name, initial, min_value, max_value, step):
-      # Check if the entity already exists
-      entity_state = self.get_state(entity_id)
-      # entity_state = None
-      
-      if entity_state is None:
-         # Entity doesn't exist, so create it with the initial value
-         self.log(f"Creating {entity_id} with initial value {initial}")
-         self.set_state(entity_id, state=initial, attributes={
-            "min": min_value,
-            "max": max_value,
-            "step": step,
-            "mode": "slider",
-            #"mode": "slider-entity-row",
-            "friendly_name": name
-         })
-      #else:
-         # Entity exists, don't overwrite it
-         #self.log(f"{entity_id} already exists with value {entity_state}")
 
 
    def main_update_routine(self, kwargs):
@@ -142,6 +114,8 @@ class EnergyCalculations(hass.Hass):
             # Fetch the current state of the sensor (convert to float, default to 0 if it doesn't exist)
             current_cost_euro = self.get_state(self.entity_id_running_energy_costs)
             if current_cost_euro is None:
+               current_cost_euro = 0.0
+            if current_cost_euro == "unknown":
                current_cost_euro = 0.0
             else:
                current_cost_euro = float(current_cost_euro)
@@ -293,4 +267,3 @@ class EnergyCalculations(hass.Hass):
       minutes_in_month = days_in_month * minutes_per_day
 
       return minutes_in_month
-
