@@ -1,0 +1,110 @@
+##################################################
+# ENERGY CALCULATIONS + AC CONTROLLER ENTITIES
+##################################################
+
+input_number:
+  day_transfer_charge:
+    name: Day Transfer Charge
+    min: 0
+    max: 10
+    step: 0.1
+    unit_of_measurement: "c/kWh"
+    icon: mdi:flash
+
+  night_transfer_charge:
+    name: Night Transfer Charge
+    min: 0
+    max: 10
+    step: 0.1
+    unit_of_measurement: "c/kWh"
+    icon: mdi:weather-night
+
+  target_room_min_temperature:
+    name: Min Room Temperature
+    min: 10
+    max: 30
+    step: 0.5
+    unit_of_measurement: "°C"
+
+  target_room_temperature:
+    name: Target Room Temperature
+    min: 10
+    max: 30
+    step: 0.5
+    unit_of_measurement: "°C"
+
+  target_room_max_temperature:
+    name: Max Room Temperature
+    min: 10
+    max: 30
+    step: 0.5
+    unit_of_measurement: "°C"
+
+  min_mean_price_multiplier:
+    name: Min Mean Price Multiplier
+    min: 0.1
+    max: 2.0
+    step: 0.1
+
+  max_mean_price_multiplier:
+    name: Max Mean Price Multiplier
+    min: 0.1
+    max: 2.0
+    step: 0.1
+
+  min_absolute_price:
+    name: Min Absolute Price
+    min: 0
+    max: 100
+    step: 0.5
+    unit_of_measurement: "c/kWh"
+
+  max_absolute_price:
+    name: Max Absolute Price
+    min: 0
+    max: 100
+    step: 0.5
+    unit_of_measurement: "c/kWh"
+
+  min_state_change_time:
+    name: Min State Change Time (sec)
+    min: 0
+    max: 3600
+    step: 60
+    unit_of_measurement: "s"
+
+  ignore_change_time_temp_diff:
+    name: Ignore Change Temp Diff
+    min: 0
+    max: 10
+    step: 0.5
+    unit_of_measurement: "°C"
+
+input_boolean:
+  manual_override_set:
+    name: AC Manual Override
+    icon: mdi:hand
+
+template:
+  - sensor:
+      - name: "Running Energy Costs"
+        unique_id: running_energy_costs
+        unit_of_measurement: "€"
+        state_class: total_increasing
+        icon: mdi:currency-eur
+        state: "{{ states('sensor.running_energy_costs') }}"
+      - name: "Electricity Price"
+        unique_id: electricity_price
+        unit_of_measurement: "c/kWh"
+        icon: mdi:lightning-bolt
+        state: "{{ states('sensor.electricity_price') }}"
+      - name: "Electricity Price (€/kWh)"
+        unique_id: electricity_price_e_kwh
+        unit_of_measurement: "€/kWh"
+        icon: mdi:currency-eur
+        state: "{{ states('sensor.electricity_price_e_kwh') }}"
+      - name: "Mean Electricity Price (c/kWh)"
+        unique_id: electricity_price_mean_c_kwh
+        unit_of_measurement: "c/kWh"
+        icon: mdi:chart-line
+        state: "{{ states('sensor.electricity_price_mean_c_kwh') }}"
