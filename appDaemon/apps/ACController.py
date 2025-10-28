@@ -40,7 +40,8 @@ class ACController(hass.Hass):
 
 
   target_room_min_temperature_id = "input_number.target_room_min_temperature"
-  target_room_temperature_id = "input_number.target_room_temperature"
+  # TODO: target_room_temperature is taken for some reason, figure out why and fix thiiis
+  target_room_temperature_id = "input_number.target_room_temperature_2"
   target_room_max_temperature_id = "input_number.target_room_max_temperature"
   
   min_mean_price_multiplier_id = "input_number.min_mean_price_multiplier"
@@ -70,7 +71,6 @@ class ACController(hass.Hass):
   def initialize(self):
     # Define all variables inside the instance of this class
     self.last_state_change_time = datetime.now() - timedelta(seconds=self.min_state_change_time+1)
-    self.initialize_all_parameters()
     self.update_internal_parameters()
 
     # Calculate the next time to run the function, 1 second past the next full minute
@@ -79,89 +79,12 @@ class ACController(hass.Hass):
     start_time = next_minute.replace(second=2, microsecond=0)
 
     # Schedule the function to run every state_update_timer seconds
-    # self.run_every(self.control_climate, "now", self.state_update_timer)
     self.run_minutely(self.control_climate, start=start_time)
     
-
-  def create_input_date(self, entity_id, name):
-    # Check if the entity already exists
-    entity_state = self.get_state(entity_id)
-    # entity_state = None
-    
-    if entity_state is None:
-      # Entity doesn't exist, so create it with the initial value
-      self.log(f"Creating {entity_id} with initial value")
-      now = datetime.now()
-      self.set_state(entity_id, state="", attributes={
-          "year": now.year,
-          "month": now.month,
-          "day": now.day,
-          "hour": now.hour,
-          "second": now.second,
-          "friendly_name": name
-      })
-
-  def create_numeric_entity(self, entity_id, name, initial_value, unit_of_measurement):
-      # Check if the entity already exists
-      entity_state = self.get_state(entity_id)
-      
-      if entity_state is None:
-          # Entity doesn't exist, so create it with the initial value
-          self.log(f"Creating {entity_id} with initial value {initial_value}")
-          self.set_state(entity_id, state=initial_value, attributes={
-              "unit_of_measurement": unit_of_measurement,
-              "friendly_name": name
-          })
-
-  def create_input_number(self, entity_id, name, initial, min_value, max_value, step):
-    # Check if the entity already exists
-    entity_state = self.get_state(entity_id)
-    # entity_state = None
-    
-    if entity_state is None:
-      # Entity doesn't exist, so create it with the initial value
-      self.log(f"Creating {entity_id} with initial value {initial}")
-      self.set_state(entity_id, state=initial, attributes={
-          "min": min_value,
-          "max": max_value,
-          "step": step,
-          "mode": "slider",
-          #"mode": "slider-entity-row",
-          "friendly_name": name
-      })
-    #else:
-      # Entity exists, don't overwrite it
-      #self.log(f"{entity_id} already exists with value {entity_state}")
-
-  def create_input_boolean(self, entity_id, name, initial_state):
-    # Check if the entity already exists
-    entity_state = self.get_state(entity_id)
-
-    if entity_state is None:
-      # Entity doesn't exist, so create it with the initial state
-      self.log(f"Creating {entity_id} with initial state {initial_state}")
-      self.set_state(entity_id, state=initial_state, attributes={"friendly_name": name})
-
 
   def initialize_all_parameters(self):
     # Dynamically create or set default values for input_number entities only if they don't exist
     # self.log(f"Update all parameters")
-    self.create_input_number(self.target_room_min_temperature_id, "Min Room Temperature", 18, 10, 30, 0.5)
-    self.create_input_number(self.target_room_temperature_id, "Target Room Temperature", 23, 10, 30, 0.5)
-    self.create_input_number(self.target_room_max_temperature_id, "Max Room Temperature", 24, 10, 30, 0.5)
-    
-    self.create_input_number(self.min_mean_price_multiplier_id, "Min Mean Price Multiplier", 0.5, 0.1, 2.0, 0.1)
-    self.create_input_number(self.max_mean_price_multiplier_id, "Max Mean Price Multiplier", 1.5, 0.1, 2.0, 0.1)
-    
-    self.create_input_number(self.min_absolute_price_id, "Min Absolute Price", 5.0, 0.0, 100.0, 0.5)
-    self.create_input_number(self.max_absolute_price_id, "Max Absolute Price", 30.0, 0.0, 100.0, 0.5)
-    
-    self.create_input_number(self.min_state_change_time_id, "Min State Change Time (sec)", 1800, 0, 3600, 60)
-    self.create_input_number(self.ignore_change_time_temp_diff_id, "Temp Diff to Ignore Time", 2, 0, 10, 0.5)
-
-    self.create_input_boolean(self.manual_override_set_id, "AC manual override set", "off")
-
-    # self.create_input_date(self.manual_override_end_time_id, "Manual control end time")
 
     # manual_override_end_time
     #manual_override_target_temp   
@@ -199,7 +122,7 @@ class ACController(hass.Hass):
     self.min_absolute_price = float(self.get_state(self.min_absolute_price_id))
     self.max_absolute_price = float(self.get_state(self.max_absolute_price_id))
 
-    self.min_state_change_time = int(self.get_state(self.min_state_change_time_id))
+    self.min_state_change_time = int(float(self.get_state(self.min_state_change_time_id)))
     self.ignore_change_time_temp_diff = float(self.get_state(self.ignore_change_time_temp_diff_id))
 
 
@@ -438,4 +361,4 @@ class ACController(hass.Hass):
 
     self.control_AC(target_temperature)
     self.update_custom_sensors(target_temperature)
-  
+
