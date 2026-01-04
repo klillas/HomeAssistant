@@ -4,12 +4,12 @@ from datetime import datetime, timedelta
 
 
 class EnergyCalculations(hass.Hass):
-   vaasa_elektriska_monthly_cost   = 4.00    # Vaasa elektriska monthly subscription cost in euro
-   electric_grid_monthly_cost      = 27.37   # Electric grid connection monthly cost in euro
+   vaasa_elektriska_monthly_cost   = 4.90    # Vaasa elektriska monthly subscription cost in euro
+   electric_grid_monthly_cost      = 29.54   # Electric grid connection monthly cost in euro
 
-   day_transfer_charge           = 3.87      # Grid transfer cost in cent/kWh from 07 - 22
-   night_transfer_charge         = 1.31      # Grid transfer cost in cent/kWh from 22 - 07
-   vaasa_elektriska_transfer_charge = 0.41   # Vaasa elektriska pörssisähkö transfer charge in cent/kWh
+   day_transfer_charge           = 4.03      # Grid transfer cost in cent/kWh from 07 - 22
+   night_transfer_charge         = 1.35      # Grid transfer cost in cent/kWh from 22 - 07
+   vaasa_elektriska_transfer_charge = 0.48   # Vaasa elektriska pörssisähkö transfer charge in cent/kWh
    electricity_tax      = 2.87               # Electricity tax c/kWh
                                              # Currently not in use
 
@@ -18,8 +18,8 @@ class EnergyCalculations(hass.Hass):
    entity_id_running_energy_costs = "sensor.running_energy_costs"
    entity_id_nordpool_sensor  = "sensor.nordpool_kwh_fi_eur_3_10_0255"
 
-   day_transfer_charge_id = "input_number.day_transfer_charge"
-   night_transfer_charge_id = "input_number.night_transfer_charge"
+   # day_transfer_charge_id = "input_number.day_transfer_charge"
+   # night_transfer_charge_id = "input_number.night_transfer_charge"
 
    absolute_electricity_price_c_kWh_id = "sensor.electricity_price"
    absolute_electricity_price_E_kWh_id = "sensor.electricity_price_E_kWh"
@@ -32,7 +32,7 @@ class EnergyCalculations(hass.Hass):
       next_minute = now + timedelta(minutes=1)
       start_time = next_minute.replace(second=1, microsecond=0)
 
-      self.update_internal_parameters()
+      # self.update_internal_parameters()
 
       # Schedule the function to run at 1 second past every new minute
       self.run_every(self.main_update_routine, start_time, self.update_interval_minutes * 60)
@@ -41,25 +41,25 @@ class EnergyCalculations(hass.Hass):
    def initialize_all_parameters(self):
       # Set up state listeners (callbacks) for when these values change
       self.listen_event(self.change_state, event="call_service")
-      self.listen_state(self.input_number_changed, self.day_transfer_charge_id)
-      self.listen_state(self.input_number_changed, self.night_transfer_charge_id)
+      # self.listen_state(self.input_number_changed, self.day_transfer_charge_id)
+      # self.listen_state(self.input_number_changed, self.night_transfer_charge_id)
 
 
-   def update_internal_parameters(self):
+   # def update_internal_parameters(self):
       # Update our local properties for ease of use
-      self.day_transfer_charge = float(self.get_state(self.day_transfer_charge_id))
-      self.night_transfer_charge = float(self.get_state(self.night_transfer_charge_id))
+      # self.day_transfer_charge = float(self.get_state(self.day_transfer_charge_id))
+      # self.night_transfer_charge = float(self.get_state(self.night_transfer_charge_id))
 
 
    def change_state(self,event_name,data, kwargs):
       entity_id = data["service_data"]["entity_id"]
       new_value = data["service_data"].get("value")
 
-      if entity_id == self.day_transfer_charge_id:
-         self.set_state(self.day_transfer_charge_id, state=new_value)
+      # if entity_id == self.day_transfer_charge_id:
+      #    self.set_state(self.day_transfer_charge_id, state=new_value)
 
-      elif entity_id == self.night_transfer_charge_id:
-         self.set_state(self.night_transfer_charge_id, state=new_value)
+      # elif entity_id == self.night_transfer_charge_id:
+      #    self.set_state(self.night_transfer_charge_id, state=new_value)
 
 
    def input_number_changed(self, entity, attribute, old, new, kwargs):
@@ -164,6 +164,7 @@ class EnergyCalculations(hass.Hass):
       price_now = fifteen_minute_prices[current_index]
       mean_price = self.calculate_mean_value(fifteen_minute_prices)
 
+      self.log(f"Absolute electricity price: {price_now}")
       self.set_state(self.absolute_electricity_price_c_kWh_id, state=price_now, attributes={
          "unit_of_measurement": "c/kWh",
          "friendly_name": "Electricity price history"
@@ -179,6 +180,64 @@ class EnergyCalculations(hass.Hass):
          "friendly_name": "Electricity price mean history Cent/kWh"
       })
 
+
+    
+   def log_price_matrix(self, prices, title="Price Matrix"):
+      """
+      Helper function to print a 2D matrix of prices.
+      """
+      # 1. Calculate current time index for highlighting
+      now = self.get_now() 
+      current_idx = (now.hour * 4) + (now.minute // 15)
+
+      # 2. Configuration
+      row_hours = 4  
+      items_per_hour = 4 
+      items_per_row = row_hours * items_per_hour
+      
+      log_output = [f"\n--- {title} --- [Brackets indicate current time]"]
+      
+      # 3. Build Headers (Fixed width alignment)
+      header_top = "Day   Start |"
+      header_sub = "            |"
+      
+      for h in range(row_hours):
+         # Align headers to 28 chars (4 items * 7 chars)
+         header_top += f" Hour +{h}".ljust(28) + "|"
+         header_sub += f"{'00':^7}{'15':^7}{'30':^7}{'45':^7}|"
+      
+      log_output.append(header_top)
+      log_output.append(header_sub)
+      log_output.append("-" * len(header_sub))
+
+      # 4. Loop through chunks
+      for i in range(0, len(prices), items_per_row):
+         chunk = prices[i : i + items_per_row]
+         
+         is_today = i < 96 
+         day_str = "Today" if is_today else "Tomrw"
+         start_hour_idx = (i // 4) % 24
+         
+         row_str = f"{day_str} {start_hour_idx:02}h:  |"
+         
+         for j, price in enumerate(chunk):
+            # Add separator every hour
+            if j > 0 and j % 4 == 0:
+               row_str += "|"
+            
+            # Format Item
+            if (i + j) == current_idx:
+               # Highlight current
+               row_str += f"[{float(price):5.2f}]"
+            else:
+               # Standard
+               row_str += f" {float(price):5.2f} "
+         
+         row_str += "|"
+         log_output.append(row_str)
+
+      # Print the accumulated log lines ONCE at the end
+      self.log("\n".join(log_output))
 
    def calculate_fifteen_minute_prices(self):
       today = self.get_state(self.entity_id_nordpool_sensor, attribute="today")
@@ -196,23 +255,27 @@ class EnergyCalculations(hass.Hass):
             tomorrow = [tomorrow[0]] * missing + tomorrow
          fifteen_minute_prices = today + tomorrow
       else:
-         # Hacky solution to allow calculations any time of the day, even when tomorrow is not available
-         # Will probably yield acceptable results for the morning/early day, but can be way off in afternoon/evening
-         # The hope is that the next day pricing will have arrived by then
-         # self.log(f"No price for tomorrow, using todays prices as estimation for tomorrow")
          fifteen_minute_prices = today + today
 
-      self.log(f"Today+tomorrow base prices {len(fifteen_minute_prices)} items: {fifteen_minute_prices}")
+      # STEP 1: Base Prices
+      # self.log_price_matrix(fifteen_minute_prices, "STEP 1: Raw Nordpool Prices")
 
-      # Add the Vaasa Elektriska fixed transfer charge
+      # STEP 2: Add Vaasa Elektriska fixed transfer charge
       for i in range(len(fifteen_minute_prices)):
          fifteen_minute_prices[i] = fifteen_minute_prices[i] + self.vaasa_elektriska_transfer_charge
+      
+      # self.log_price_matrix(fifteen_minute_prices, "STEP 2: + Vaasa Transfer Charge")
 
-      # Add the electricity tax
+      # STEP 3: Add the electricity tax
       for i in range(len(fifteen_minute_prices)):
          fifteen_minute_prices[i] = fifteen_minute_prices[i] + self.electricity_tax
+         
+      # self.log_price_matrix(fifteen_minute_prices, "STEP 3: + Electricity Tax")
 
-      # Add the night / day grid transfer charge
+      # self.log(f"night transfer charge: {self.night_transfer_charge}")
+      # self.log(f"day transfer charge: {self.day_transfer_charge}")
+
+      # STEP 4: Add the night / day grid transfer charge
       for i in range(len(fifteen_minute_prices)):
          hour = (i % 96) // 4   # Convert 15-min index to hour (0–23)
          
@@ -222,17 +285,18 @@ class EnergyCalculations(hass.Hass):
          else:
             # Day transfer charge
             fifteen_minute_prices[i] = fifteen_minute_prices[i] + self.day_transfer_charge
+      
+      # self.log_price_matrix(fifteen_minute_prices, "STEP 4: + Grid Transfer (Day/Night)")
 
-
+      # STEP 5: Safety check for negative prices
       for i in range(len(fifteen_minute_prices)):
-         # Safety in case once in a blue moon we get negative prices
-         # Setting it to 0 will avoid any strange calculations later on
-         # This will have minimal effect in practice and will almost never be applied
          if (fifteen_minute_prices[i] < 0):
             fifteen_minute_prices[i] = 0
 
-      # Round each price to one decimal place
+      # STEP 6: Round each price to one decimal place
       fifteen_minute_prices = [round(price, 1) for price in fifteen_minute_prices]
+      
+      # self.log_price_matrix(fifteen_minute_prices, "STEP 6: Final Rounded Prices")
 
       return fifteen_minute_prices
    
