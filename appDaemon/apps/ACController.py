@@ -292,10 +292,10 @@ class ACController(hass.Hass):
         self.call_service("climate/set_hvac_mode", entity_id=self.entity_id_climate_control, hvac_mode="fan_only")
         time.sleep(2)
 
-      if (ac_fan_mode != "Silent"):
-        self.log(f"Set fan to silent")
-        self.call_service("climate/set_fan_mode", entity_id=self.entity_id_climate_control, fan_mode="Silent")
-        time.sleep(2)
+      #if (ac_fan_mode != "Silent"):
+      #  self.log(f"Set fan to silent")
+      #  self.call_service("climate/set_fan_mode", entity_id=self.entity_id_climate_control, fan_mode="Silent")
+      #  time.sleep(2)
 
     else:
       # Make sure AC is running and has the correct target temperatures
@@ -317,17 +317,17 @@ class ACController(hass.Hass):
         self.call_service("climate/set_hvac_mode", entity_id=self.entity_id_climate_control, hvac_mode="heat")
         time.sleep(2)
 
-      if (ac_fan_mode != "Medium"):
-        self.log(f"Set AC fan to Medium")
-        self.last_state_change_time = datetime.now()
-        self.call_service("climate/set_fan_mode", entity_id=self.entity_id_climate_control, fan_mode="Medium")
-        time.sleep(2)
+      #if (ac_fan_mode != "Medium"):
+      #  self.log(f"Set AC fan to Medium")
+      #  self.last_state_change_time = datetime.now()
+      #  self.call_service("climate/set_fan_mode", entity_id=self.entity_id_climate_control, fan_mode="Medium")
+      #  time.sleep(2)
 
-      if (ac_swing_mode != "Horizontal"):
-        self.log(f"Set AC swing mode to Horizontal")
-        self.last_state_change_time = datetime.now()
-        self.call_service("climate/set_swing_mode", entity_id=self.entity_id_climate_control, swing_mode="Horizontal")
-        time.sleep(2)
+      #if (ac_swing_mode != "Horizontal"):
+      #  self.log(f"Set AC swing mode to Horizontal")
+      #  self.last_state_change_time = datetime.now()
+      #  self.call_service("climate/set_swing_mode", entity_id=self.entity_id_climate_control, swing_mode="Horizontal")
+      #  time.sleep(2)
 
 
   def update_custom_sensors(self, target_temperature):
