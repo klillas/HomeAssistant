@@ -1,0 +1,149 @@
+name: EV charger
+products:
+  - id: j5bnewrcalhf5rol
+    manufacturer: Vevor
+    model: EV-B07-EU011B
+entities:
+  - entity: sensor
+    translation_key: status
+    class: enum
+    icon: "mdi:ev-station"
+    dps:
+      - id: 3
+        type: string
+        name: sensor
+        mapping:
+          - dps_val: charger_free
+            value: available
+          - dps_val: charger_insert
+            value: plugged_in
+          - dps_val: charger_free_fault
+            value: fault_unplugged
+          - dps_val: charger_wait
+            value: waiting
+          - dps_val: charger_charging
+            value: charging
+          - dps_val: charger_pause
+            value: paused
+          - dps_val: charger_end
+            value: charged
+          - dps_val: charger_fault
+            value: fault
+      - id: 23
+        type: string
+        name: system_version
+  - entity: sensor
+    class: energy
+    dps:
+      - id: 1
+        type: integer
+        name: sensor
+        unit: kWh
+        class: total_increasing
+        mapping:
+          - scale: 100
+  - entity: number
+    name: Charge current
+    category: config
+    class: current
+    dps:
+      - id: 4
+        type: integer
+        name: value
+        unit: A
+        range:
+          min: 8
+          max: 16
+  - entity: sensor
+    class: power
+    dps:
+      - id: 9
+        type: integer
+        name: sensor
+        unit: kW
+        class: measurement
+        mapping:
+          - scale: 1000
+  - entity: binary_sensor
+    class: problem
+    category: diagnostic
+    dps:
+      - id: 10
+        type: bitfield
+        name: sensor
+        mapping:
+          - dps_val: 0
+            value: false
+          - value: true
+      - id: 10
+        type: bitfield
+        name: fault_code
+  - entity: sensor
+    name: Connection state
+    class: enum
+    category: diagnostic
+    icon: "mdi:ev-plug-type2"
+    dps:
+      - id: 13
+        type: string
+        name: sensor
+        mapping:
+          - dps_val: controlpi_12v
+            value: standby
+          - dps_val: controlpi_12v_pwm
+            value: Communication initialising
+          - dps_val: controlpi_9v
+            value: Vehicle detected
+          - dps_val: controlpi_9v_pwm
+            value: Vehicle connected
+          - dps_val: controlpi_6v
+            value: Ready to charge
+          - dps_val: controlpi_6v_pwm
+            value: charging
+          - dps_val: controlpi_error
+            value: fault
+  - entity: select
+    translation_key: charging_mode
+    category: config
+    dps:
+      - id: 14
+        type: string
+        name: option
+        mapping:
+          - dps_val: charge_now
+            value: immediate
+          - dps_val: charge_pct
+            value: charge_to_percent
+          - dps_val: charge_energy
+            value: fixed_charge
+          - dps_val: charge_schedule
+            value: scheduled_charge
+          - dps_val: charge_delay
+            value: delayed_charge
+  - entity: switch
+    icon: "mdi:ev-station"
+    dps:
+      - id: 18
+        type: boolean
+        name: switch
+  - entity: sensor
+    class: temperature
+    category: diagnostic
+    dps:
+      - id: 24
+        type: integer
+        name: sensor
+        unit: C
+        class: measurement
+  - entity: number
+    name: Delay
+    class: duration
+    category: config
+    dps:
+      - id: 28
+        type: integer
+        name: value
+        unit: h
+        range:
+          min: 0
+          max: 12

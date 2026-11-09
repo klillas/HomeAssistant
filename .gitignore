@@ -1,0 +1,26 @@
+# Local credentials and Home Assistant runtime data
+.env
+.env.*
+!.env.example
+secrets.yaml
+secrets.*.yaml
+.storage/
+HomeAssistant-Private/
+*local-device-key*
+*.key
+*.pem
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.log.*
+*.tar
+*.tar.gz
+*.zip
+
+# Python tooling and reproducible exports
+.venv/
+__pycache__/
+.pytest_cache/
+leaf-smart-charging-deploy.json
+/automations/leaf-smart-charging/generated/
