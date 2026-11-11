@@ -79,6 +79,40 @@ Startup handover has a separate five-minute grace because mode/switch and pilot/
 power reports do not arrive simultaneously. Fault, disable, target, and battery
 freshness protections are not bypassed by that grace.
 
+### Request Coordination and Recovery
+
+All charger writes, including reset and idle maintenance, pass through one
+transaction script. New program requests invalidate older work; request timestamps
+also detect a change away from and back to the same selection. Ordinary feedback
+does not queue additional controller runs. Normal requests settle for two seconds,
+while disable, fault, target, and invalid active-charge safety data cancel current
+verification work promptly.
+
+Arming requires ten seconds of consistent mode/delay/idle feedback after enabling
+the timer. The displayed start uses the enable-command time, not the end of that
+verification period. Failed acknowledgement clears the timer settings. Immediate
+startup verification waits up to five minutes for reported charging activity.
+
+An unexpectedly lost timer or failed start permits at most two recovery attempts
+for the same program, with a 60-second retry cooldown. Timer recovery stays within
+the original night window and respects the charger's integer-hour constraint;
+its replacement start can differ from the original start. Recovery exhaustion
+stops the charger and creates a persistent HA notification. An intentional stop,
+target completion, fault, disable, or confirmed disconnect does not use this retry
+path. Select the required program again to resume a stopped request.
+
+The next-start display distinguishes stopped, recovering, and failed requests.
+It shows Charging only with reported power/activity, not merely a passed timestamp.
+The request-generation helper must retain its restored value across HA restarts;
+do not give it a fixed YAML `initial` value.
+
+The regression suite executes the source templates and transaction sequences in
+an offline fixture, including stale requests and delayed feedback. It is not a
+simulation of HA's complete asynchronous scheduler or the charger's firmware.
+Practical rapid-program-change and delayed-start testing of this coordination
+update remains pending; software validation alone does not establish hardware
+repeatability.
+
 The controller does not change amperage. Configure the charger independently for
 the installation's wiring, circuit protection, and vehicle. The supplied profile
 is deliberately limited to the tested 16 A setup; do not raise limits just because
@@ -115,8 +149,8 @@ evidence for later improvements without a special unplug/replug test tonight.
 | [leaf-smart-charging.yaml](leaf-smart-charging.yaml) | Authoritative source: templates, helpers, scripts, automations, program indicators, dashboard, and prerequisite metadata |
 | [tuya_local/vevor_ev_b07_eu011b.yaml](tuya_local/vevor_ev_b07_eu011b.yaml) | Reusable charger-model profile, not an individual device's credentials |
 | [export.py](export.py) | Offline conversion to native HA installation files; no HA connection or deployment |
-| [test_export.py](test_export.py) | Export round-trip, completeness, and dashboard binding tests |
-| [requirements.txt](requirements.txt) | Export/test dependency |
+| [test_export.py](test_export.py) | Export/dashboard checks and template/transaction behavior regressions |
+| [requirements.txt](requirements.txt) | Export/test dependencies |
 | [screenshots](screenshots/) | Cropped documentation images |
 
 **Do not include the source definition directly as an HA package.** Its top-level
@@ -285,6 +319,12 @@ reuse helpers/template helpers with the same entity IDs. The source's
 `program_indicators` and `program_status` sections also contain the name/state
 templates needed to create those helpers through the UI. Add or update the
 dashboard cards without replacing unrelated dashboard content.
+
+When updating an older version, also create `input_text.leaf_control_generation`
+(name Leaf Control Generation, maximum length 40). Set its value to `base` once
+when adopting existing plans that have no generation metadata. Do not reset it on
+subsequent updates or restarts. Add the new transaction/request scripts together
+with the matching controller and automation changes, not independently.
 
 Do not simultaneously load `package.yaml` and create the same objects through the
 UI. Do not blindly append duplicate scripts, automation IDs, helpers, or template

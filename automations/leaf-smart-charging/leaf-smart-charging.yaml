@@ -156,7 +156,9 @@ templates:
     {% set index = ((now_ts - plan.get('s', 0)) / 900)|int %}
     {% set immediate = request in ['Immediate to 80%', 'Immediate to 100%'] %}
     {% set start = plan.get('a', plan.get('s', 0) + (plan.get('i', [0]) or [0])[0] * 900) %}
-    {% set ns = namespace(charge=false, arm=false, keep_timer=false, reset=false, reason='Waiting for 22:00') %}
+    {% set ns = namespace(charge=false, arm=false, keep_timer=false, reset=false,
+      recover=false, failed=false, hours=plan.get('h', 0), selected_start=start,
+      reason='Waiting for 22:00') %}
     {% if not enabled %}
       {% set ns.reason = 'Disabled' %}
     {% elif not connected %}
@@ -175,20 +177,65 @@ templates:
     {% elif soc >= target %}
       {% set ns.reason = 'Target reached (' ~ target ~ '%)' %}
       {% set ns.reset = request != 'Automatic' %}
+    {% elif plan.get('k', false) %}
+      {% set ns.reason = 'Charging stopped; select the required program to resume' %}
     {% elif immediate %}
-      {% set ns.charge = true %}
-      {% set ns.reason = 'Charging immediately to ' ~ target ~ '% (price override)' %}
+      {% if not already_charging and plan.get('l', false) and plan.get('n', 0) >= 2 %}
+        {% set ns.failed = true %}
+        {% set ns.reason = 'Charger start failed; check charger and select program again' %}
+      {% elif not already_charging and plan.get('l', false) and now_ts < plan.get('u', 0) + 60 %}
+        {% set ns.recover = true %}
+        {% set ns.reason = 'Startup verification failed; retry pending' %}
+      {% else %}
+        {% set ns.charge = true %}
+        {% set ns.recover = plan.get('l', false) and not already_charging %}
+        {% set ns.reason = ('Charging immediately to ' if already_charging else 'Starting charge to ')
+            ~ target ~ '% (price override)' %}
+      {% endif %}
     {% elif plan.get('x', false) %}
       {% if plan.get('k', false) %}
         {% set ns.reason = 'Night block stopped; resume automatic charging to replan' %}
+      {% elif now_ts >= plan.get('e', 0) %}
+        {% set ns.reason = 'Night window ended' %}
       {% elif timer_armed %}
         {% set ns.keep_timer = true %}
-        {% set ns.charge = night and now_ts >= start %}
+        {% set ns.charge = night and now_ts >= start and already_charging %}
         {% set ns.reason = (('Continuous night charging to ' ~ target ~ '%')
-            if already_charging else 'Timer expired; waiting for charger startup') if ns.charge
+            if already_charging else 'Timer expired; waiting for charger startup') if now_ts >= start
             else ('Charger timer armed for ' ~ start|timestamp_custom('%H:%M')) %}
       {% else %}
-        {% set ns.reason = 'Charger timer interrupted; resume automatic charging to replan' %}
+        {% set ns.recover = true %}
+        {% if plan.get('n', 0) >= 2 %}
+          {% set ns.failed = true %}
+          {% set ns.reason = 'Charger recovery failed; check charger and select program again' %}
+        {% elif now_ts < plan.get('u', 0) + 60 %}
+          {% set ns.reason = 'Timer lost; retry pending' %}
+        {% elif start <= now_ts and night %}
+          {% set ns.charge = true %}
+          {% set ns.hours = 0 %}
+          {% set ns.selected_start = now_ts|int %}
+          {% set ns.reason = 'Retrying charger startup' %}
+        {% elif start > now_ts %}
+          {% set required = [0, (target - soc) / rate * 3600]|max %}
+          {% set up = ((start - now_ts) / 3600)|round(0, 'ceil')|int %}
+          {% set down = ((start - now_ts) / 3600)|int %}
+          {% set hours = up if now_ts + up * 3600 + required <= plan.e
+              or now_ts + down * 3600 < plan.s else down %}
+          {% set candidate = (now_ts|int) + hours * 3600 %}
+          {% if 0 <= hours <= 12 and plan.s <= candidate < plan.e %}
+            {% set ns.hours = hours %}
+            {% set ns.selected_start = candidate %}
+            {% set ns.arm = hours > 0 %}
+            {% set ns.charge = hours == 0 and night %}
+            {% set ns.reason = 'Recovering charger timer' %}
+          {% else %}
+            {% set ns.failed = true %}
+            {% set ns.reason = 'Timer cannot be recovered within the night window' %}
+          {% endif %}
+        {% else %}
+          {% set ns.failed = true %}
+          {% set ns.reason = 'Timer recovery outside the allowed charging window' %}
+        {% endif %}
       {% endif %}
     {% elif night and plan.get('c', false) and
           ((plan.get('h') == 0 and now_ts >= start) or index in plan.get('i', [])) %}
@@ -225,7 +272,8 @@ templates:
     {% endif %}
     {{ {'charge': ns.charge, 'reset': ns.reset, 'reason': ns.reason,
       'target': target, 'night': night, 'arm': ns.arm, 'keep_timer': ns.keep_timer,
-      'delay_hours': plan.get('h', 0), 'start': start}|to_json }}
+      'recover': ns.recover, 'failed': ns.failed,
+      'delay_hours': ns.hours, 'start': ns.selected_start}|to_json }}
   next_start: &next_start >-
     {% if not enabled %}
       Disabled
@@ -235,14 +283,23 @@ templates:
       Charger unavailable
     {% elif not soc_valid %}
       Waiting for battery data
+    {% elif not fresh and not decision.keep_timer %}
+      Waiting for fresh battery data
     {% elif soc >= target %}
       Target reached
+    {% elif plan.get('k', false) %}
+      Stopped - resume night charging
+    {% elif decision.get('failed', false) %}
+      Failed - check charger
+    {% elif decision.get('recover', false) %}
+      Recovering charger timer
     {% elif request in ['Immediate to 80%', 'Immediate to 100%'] %}
-      {{ 'Now' if decision.charge else 'Waiting for battery data' }}
+      {{ 'Charging' if decision.charge and already_charging else decision.reason }}
     {% elif soc < 20 and decision.charge %}
       Now
     {% elif plan.get('a') %}
-      {{ 'Now' if now_ts >= plan.a else plan.a|timestamp_custom('%H:%M') }}
+      {{ ('Charging' if already_charging else decision.reason)
+          if now_ts >= plan.a else plan.a|timestamp_custom('%H:%M') }}
     {% elif not plan.get('c', false) %}
       Waiting for night prices
     {% else %}
@@ -297,6 +354,9 @@ helpers:
         - Immediate to 100%
       icon: mdi:car-clock
   input_text:
+    leaf_control_generation:
+      name: Leaf Control Generation
+      max: 40
     leaf_night_plan:
       name: Leaf Night Plan
       max: 255
@@ -310,6 +370,213 @@ helpers:
       max: 80
       icon: mdi:clock-start
 scripts:
+  leaf_charger_write:
+    alias: Leaf Charger Transaction
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - variables:
+          generation: "{{ generation|default(states('input_text.leaf_control_generation')) }}"
+          request: "{{ request|default(states('input_select.leaf_charging_request')) }}"
+          request_stamp: "{{ request_stamp|default(states.input_select.leaf_charging_request.last_changed.isoformat()) }}"
+          operation: "{{ operation|default('stop') }}"
+          hours: '{{ hours|default(0)|int }}'
+          target: "{{ 100 if request in ['Night to 100%', 'Immediate to 100%'] else 80 }}"
+          result:
+            ok: false
+            superseded: true
+      - &transaction_guard
+        if: >-
+          {{ states('input_text.leaf_control_generation') != generation
+             or states('input_select.leaf_charging_request') != request
+             or states.input_select.leaf_charging_request.last_changed.isoformat() != request_stamp
+             or (operation not in ['stop', 'idle'] and
+               (not is_state('input_boolean.leaf_smart_charging', 'on')
+                or not is_state('binary_sensor.nissan_charge_problem', 'off')
+                or not is_number(states('number.nissan_charge_charge_current'))
+                or not 8 <= states('number.nissan_charge_charge_current')|float(0) <= 16
+                or not is_number(states('sensor.leaf_battery_level'))
+                or not 0 <= states('sensor.leaf_battery_level')|float(-1) < target
+                or not -120 <= as_timestamp(now()) - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600
+                or not (states('sensor.nissan_charge_connection_state') in
+                    ['Vehicle detected', 'Vehicle connected', 'Ready to charge', 'charging']
+                  or is_state('binary_sensor.leaf_plugged_in', 'on')))) }}
+        then:
+          - stop: Superseded request or charging guard changed
+            response_variable: result
+      - choose:
+          - conditions: "{{ operation == 'idle' }}"
+            sequence:
+              - condition: template
+                value_template: *idle_delay_allowed
+              - action: number.set_value
+                target:
+                  entity_id: number.nissan_charge_delay
+                data:
+                  value: 11
+              - *transaction_guard
+              - condition: template
+                value_template: *idle_delay_allowed
+              - action: number.set_value
+                target:
+                  entity_id: number.nissan_charge_delay
+                data:
+                  value: 12
+              - *transaction_guard
+              - condition: template
+                value_template: *idle_delay_allowed
+              - action: select.select_option
+                target:
+                  entity_id: select.nissan_charge_charging_mode
+                data:
+                  option: delayed_charge
+          - conditions: "{{ operation == 'stop' }}"
+            sequence: &stop_transaction
+              - *transaction_guard
+              - if: "{{ not is_state('switch.nissan_charge', 'off') }}"
+                then:
+                  - action: switch.turn_off
+                    target:
+                      entity_id: switch.nissan_charge
+              - *transaction_guard
+              - if: "{{ not is_state('select.nissan_charge_charging_mode', 'immediate') }}"
+                then:
+                  - action: select.select_option
+                    target:
+                      entity_id: select.nissan_charge_charging_mode
+                    data:
+                      option: immediate
+              - *transaction_guard
+              - if: "{{ states('number.nissan_charge_delay')|int(-1) != 0 }}"
+                then:
+                  - action: number.set_value
+                    target:
+                      entity_id: number.nissan_charge_delay
+                    data:
+                      value: 0
+              - *transaction_guard
+              - if: "{{ not is_state('switch.nissan_charge', 'off') }}"
+                then:
+                  - action: switch.turn_off
+                    target:
+                      entity_id: switch.nissan_charge
+          - conditions: "{{ operation in ['arm', 'charge'] }}"
+            sequence:
+              - if: "{{ operation == 'arm' }}"
+                then:
+                  - condition: template
+                    value_template: '{{ 1 <= hours <= 12 }}'
+                  - *transaction_guard
+                  - action: switch.turn_off
+                    target:
+                      entity_id: switch.nissan_charge
+              - *transaction_guard
+              - if: "{{ not is_state('select.nissan_charge_charging_mode', 'immediate') }}"
+                then:
+                  - action: select.select_option
+                    target:
+                      entity_id: select.nissan_charge_charging_mode
+                    data:
+                      option: immediate
+              - *transaction_guard
+              - if: "{{ states('number.nissan_charge_delay')|int(-1) != hours }}"
+                then:
+                  - action: number.set_value
+                    target:
+                      entity_id: number.nissan_charge_delay
+                    data:
+                      value: '{{ hours }}'
+              - *transaction_guard
+              - if: "{{ operation == 'arm' }}"
+                then:
+                  - action: select.select_option
+                    target:
+                      entity_id: select.nissan_charge_charging_mode
+                    data:
+                      option: delayed_charge
+              - wait_template: >-
+                  {{ is_state('select.nissan_charge_charging_mode',
+                       'delayed_charge' if operation == 'arm' else 'immediate')
+                     and states('number.nissan_charge_delay')|int(-1) == hours }}
+                timeout: '00:00:30'
+                continue_on_timeout: true
+              - *transaction_guard
+              - if: '{{ not wait.completed }}'
+                then: *stop_transaction
+              - if: '{{ not wait.completed }}'
+                then:
+                  - variables:
+                      result:
+                        ok: false
+                        superseded: false
+                  - stop: Charger did not acknowledge requested settings
+                    response_variable: result
+              - variables:
+                  command_start: '{{ (as_timestamp(now())|int) + hours * 3600 }}'
+              - *transaction_guard
+              - if: "{{ operation == 'arm' or not is_state('switch.nissan_charge', 'on') }}"
+                then:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: switch.nissan_charge
+              - if: "{{ operation == 'arm' }}"
+                then:
+                  - repeat:
+                      count: 10
+                      sequence:
+                        - delay:
+                            seconds: 1
+                        - *transaction_guard
+                        - variables:
+                            stable: >-
+                              {{ is_state('select.nissan_charge_charging_mode', 'delayed_charge')
+                                 and states('number.nissan_charge_delay')|int(-1) == hours
+                                 and is_number(states('sensor.nissan_charge_power'))
+                                 and states('sensor.nissan_charge_power')|float(1) <= 0.05
+                                 and states('sensor.nissan_charge_status') in ['available', 'waiting', 'plugged_in'] }}
+                        - if: '{{ not stable }}'
+                          then: *stop_transaction
+                        - if: >-
+                            {{ not stable }}
+                          then:
+                            - variables:
+                                result:
+                                  ok: false
+                                  superseded: false
+                            - stop: Timer feedback was not stable for ten seconds
+                              response_variable: result
+                  - variables:
+                      result:
+                        ok: true
+                        start: '{{ command_start }}'
+                  - stop: Stable charger timer acknowledged
+                    response_variable: result
+                else:
+                  - wait_template: >-
+                      {{ states('sensor.nissan_charge_power')|float(0) > 0.05
+                         or is_state('sensor.nissan_charge_status', 'charging') }}
+                    timeout: '00:05:00'
+                    continue_on_timeout: true
+                  - *transaction_guard
+                  - if: '{{ not wait.completed }}'
+                    then:
+                      - action: switch.turn_off
+                        target:
+                          entity_id: switch.nissan_charge
+                  - variables:
+                      result:
+                        ok: '{{ wait.completed }}'
+                        superseded: false
+                  - stop: Charger startup verification completed
+                    response_variable: result
+        default:
+          - stop: Unknown charger operation
+            error: true
+      - variables:
+          result:
+            ok: true
+      - stop: Charger transaction completed
+        response_variable: result
   leaf_set_idle_charge_delay:
     alias: Leaf Set Idle Charge Delay
     icon: mdi:ev-station
@@ -331,25 +598,9 @@ scripts:
             response_variable: result
       - condition: template
         value_template: *idle_delay_allowed
-      - action: number.set_value
-        target:
-          entity_id: number.nissan_charge_delay
+      - action: script.leaf_charger_write
         data:
-          value: 11
-      - condition: template
-        value_template: *idle_delay_allowed
-      - action: number.set_value
-        target:
-          entity_id: number.nissan_charge_delay
-        data:
-          value: 12
-      - condition: template
-        value_template: *idle_delay_allowed
-      - action: select.select_option
-        target:
-          entity_id: select.nissan_charge_charging_mode
-        data:
-          option: delayed_charge
+          operation: idle
   leaf_preheat_car:
     alias: Leaf Toggle Preheat
     icon: mdi:radiator
@@ -369,8 +620,8 @@ scripts:
   leaf_smart_charge_controller:
     alias: Leaf Smart Charge Controller
     icon: mdi:car-electric
-    mode: queued
-    max: 5
+    mode: single
+    max_exceeded: silent
     fields:
       dry_run:
         default: false
@@ -381,12 +632,26 @@ scripts:
         selector:
           boolean: {}
     sequence:
+      - if: >-
+          {{ not dry_run|default(false)
+             and is_state('input_boolean.leaf_smart_charging', 'on')
+             and is_state('binary_sensor.nissan_charge_problem', 'off')
+             and states('sensor.leaf_battery_level')|float(0)
+               < (100 if states('input_select.leaf_charging_request') in
+                   ['Night to 100%', 'Immediate to 100%'] else 80) }}
+        then:
+          - delay:
+              seconds: 2
       - variables:
           dry_run: '{{ dry_run|default(false) }}'
           force_replan: '{{ force_replan|default(false) }}'
           now_ts: '{{ as_timestamp(now()) }}'
+          generation: "{{ states('input_text.leaf_control_generation') }}"
+          request_stamp: '{{ states.input_select.leaf_charging_request.last_changed.isoformat() }}'
           enabled: "{{ is_state('input_boolean.leaf_smart_charging', 'on') }}"
-          old_plan: "{{ states('input_text.leaf_night_plan')|from_json({}) }}"
+          saved_plan: "{{ states('input_text.leaf_night_plan')|from_json({}) }}"
+          old_plan: "{{ saved_plan if saved_plan.get('g', 'base')|string == generation else {} }}"
+          verified_unplugged: *verified_unplugged
           connected: >-
             {{ states('sensor.nissan_charge_connection_state') in
                ['Vehicle detected', 'Vehicle connected', 'Ready to charge', 'charging']
@@ -440,13 +705,19 @@ scripts:
           price_valid: >-
             {{ is_number(price_eur) and has_value('sensor.nordpool_kwh_fi_eur_3_10_0255') }}
           plan_json: *planner
-          initial_plan: '{{ plan_json|from_json }}'
+          initial_plan: >-
+            {{ (old_plan if old_plan.get('r') == request else
+                  {'r': request, 't': target, 's': 0, 'e': 0, 'c': false})
+                if request in ['Immediate to 80%', 'Immediate to 100%']
+                else plan_json|from_json }}
           timer_plan_json: *timer_plan
           plan: '{{ timer_plan_json|from_json }}'
           timer_armed: >-
-            {{ plan.get('x', false) and not plan.get('k', false)
-              and (is_state('select.nissan_charge_charging_mode',
+            {{ plan.get('x', false) and not plan.get('k', false) and not plan.get('l', false)
+              and ((now_ts < plan.get('a', 0) + 300
+                    and is_state('select.nissan_charge_charging_mode',
                             'delayed_charge' if plan.get('h', 0) > 0 else 'immediate')
+                    and states('number.nissan_charge_delay')|int(-1) == plan.get('h', 0))
                   or (now_ts >= plan.get('a', 0) and already_charging)
                   or (plan.get('h', 0) > 0
                     and plan.get('a', 0) <= now_ts < [plan.get('e', 0), plan.get('a', 0) + 300]|min
@@ -458,192 +729,170 @@ scripts:
         then:
           - stop: Dry run completed without changing helpers or charger
             response_variable: decision
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.leaf_night_plan
+        data:
+          value: '{{ dict(plan, g=generation)|to_json }}'
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.leaf_next_charge_start
+        data:
+          value: '{{ next_start|trim }}'
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.leaf_charging_status
+        data:
+          value: '{{ decision.reason }}'
       - choose:
-          - conditions: '{{ enabled }}'
+          - conditions: '{{ decision.keep_timer }}'
             sequence:
+              - variables:
+                  timer_preserved: true
+          - conditions: '{{ decision.arm or decision.charge }}'
+            sequence:
+              - variables:
+                  attempt_plan: >-
+                    {{ dict(plan, g=generation,
+                        n=plan.get('n', 0) + (1 if decision.get('recover', false) else 0),
+                        u=now_ts|int) }}
               - action: input_text.set_value
                 target:
                   entity_id: input_text.leaf_night_plan
                 data:
-                  value: >-
-                    {{ (plan if decision.arm or decision.keep_timer
-                        or (decision.charge and plan.get('h') == 0 and decision.night)
-                        else initial_plan)|to_json }}
-              - action: input_text.set_value
-                target:
-                  entity_id: input_text.leaf_next_charge_start
+                  value: '{{ dict(attempt_plan, x=true, l=true)|to_json }}'
+              - action: script.leaf_charger_write
+                continue_on_error: true
                 data:
-                  value: '{{ next_start|trim }}'
-              - action: input_text.set_value
-                target:
-                  entity_id: input_text.leaf_charging_status
-                data:
-                  value: '{{ decision.reason }}'
-              - choose:
-                  - conditions: '{{ decision.arm }}'
-                    sequence:
-                      - action: switch.turn_off
-                        target:
-                          entity_id: switch.nissan_charge
-                      - action: select.select_option
-                        target:
-                          entity_id: select.nissan_charge_charging_mode
-                        data:
-                          option: immediate
-                      - action: number.set_value
-                        target:
-                          entity_id: number.nissan_charge_delay
-                        data:
-                          value: '{{ plan.h }}'
-                      - action: select.select_option
-                        target:
-                          entity_id: select.nissan_charge_charging_mode
-                        data:
-                          option: delayed_charge
-                      - wait_template: >-
-                          {{ is_state('select.nissan_charge_charging_mode', 'delayed_charge')
-                             and states('number.nissan_charge_delay')|int(-1) == plan.h
-                             and is_state('switch.nissan_charge', 'off') }}
-                        timeout: '00:00:30'
-                        continue_on_timeout: false
-                      - condition: template
-                        value_template: >-
-                          {{ is_state('input_boolean.leaf_smart_charging', 'on')
-                             and is_state('binary_sensor.nissan_charge_problem', 'off')
-                             and states('input_select.leaf_charging_request') == request }}
-                      - action: switch.turn_on
-                        target:
-                          entity_id: switch.nissan_charge
-                      - wait_template: >-
-                          {{ is_state('select.nissan_charge_charging_mode', 'delayed_charge')
-                           and states('number.nissan_charge_delay')|int(-1) == plan.h
-                              and states('sensor.nissan_charge_status') in ['waiting', 'plugged_in', 'available']
-                           and states('sensor.nissan_charge_power')|float(1) <= 0.05 }}
-                        timeout: '00:00:30'
-                        continue_on_timeout: true
-                      - if: >-
-                          {{ not wait.completed
-                             or states('sensor.nissan_charge_power')|float(1) > 0.05 }}
-                        then:
-                          - action: switch.turn_off
-                            target:
-                              entity_id: switch.nissan_charge
-                          - action: select.select_option
-                            target:
-                              entity_id: select.nissan_charge_charging_mode
-                            data:
-                              option: immediate
-                          - action: switch.turn_off
-                            target:
-                              entity_id: switch.nissan_charge
-                          - stop: Charger did not confirm delayed waiting; stopped for safety
-                            error: true
+                  operation: "{{ 'arm' if decision.arm else 'charge' }}"
+                  generation: '{{ generation }}'
+                  request: '{{ request }}'
+                  request_stamp: '{{ request_stamp }}'
+                  hours: '{{ decision.delay_hours if decision.arm else 0 }}'
+                response_variable: write_result
+              - condition: template
+                value_template: >-
+                  {{ states('input_text.leaf_control_generation') == generation
+                     and states('input_select.leaf_charging_request') == request
+                     and states.input_select.leaf_charging_request.last_changed.isoformat() == request_stamp }}
+              - variables:
+                  outcome: '{{ write_result|default({}, true) }}'
+              - if: "{{ outcome.get('superseded', false) }}"
+                then:
+                  - stop: New request or safety event superseded this decision
+                    response_variable: decision
+              - if: "{{ outcome.get('ok', false) }}"
+                then:
+                  - if: '{{ decision.arm }}'
+                    then:
                       - variables:
-                          armed_start: '{{ (as_timestamp(now())|int) + plan.h * 3600 }}'
-                          armed_plan: >-
-                            {{ dict(plan, x=true, a=armed_start,
-                                z=[plan.e, plan.z + armed_start - plan.a]|min) }}
+                          committed: >-
+                            {{ dict(attempt_plan, x=true, l=false, h=decision.delay_hours,
+                                a=outcome.start,
+                                z=[plan.e, outcome.start + (target - soc) / rate * 3600]|min) }}
                       - action: input_text.set_value
                         target:
                           entity_id: input_text.leaf_night_plan
                         data:
-                          value: '{{ armed_plan|to_json }}'
-                      - action: input_text.set_value
-                        target:
-                          entity_id: input_text.leaf_next_charge_start
-                        data:
-                          value: "{{ armed_start|timestamp_custom('%H:%M') }}"
+                          value: '{{ committed|to_json }}'
                       - action: input_text.set_value
                         target:
                           entity_id: input_text.leaf_charging_status
                         data:
-                          value: "{{ 'Charger timer armed for ' ~ armed_start|timestamp_custom('%H:%M') }}"
-                      - action: homeassistant.save_persistent_states
-                  - conditions: '{{ decision.keep_timer }}'
-                    sequence:
-                      - variables:
-                          timer_preserved: true
-                  - conditions: '{{ decision.charge }}'
-                    sequence:
-                      - if: "{{ not is_state('select.nissan_charge_charging_mode', 'immediate') }}"
-                        then:
-                          - action: select.select_option
-                            target:
-                              entity_id: select.nissan_charge_charging_mode
-                            data:
-                              option: immediate
-                      - if: "{{ states('number.nissan_charge_delay')|float(-1) != 0 }}"
-                        then:
-                          - action: number.set_value
-                            target:
-                              entity_id: number.nissan_charge_delay
-                            data:
-                              value: 0
-                      - if: "{{ not is_state('switch.nissan_charge', 'on') }}"
-                        then:
-                          - action: switch.turn_on
-                            target:
-                              entity_id: switch.nissan_charge
-                      - if: "{{ decision.night and plan.get('h') == 0 and request not in ['Immediate to 80%', 'Immediate to 100%'] }}"
-                        then:
-                          - action: input_text.set_value
-                            target:
-                              entity_id: input_text.leaf_night_plan
-                            data:
-                              value: '{{ dict(plan, x=true)|to_json }}'
-                          - action: homeassistant.save_persistent_states
-                default:
-                  - if: >-
-                      {{ is_state('switch.nissan_charge', 'on')
-                         or states('sensor.nissan_charge_power')|float(0) > 0.05
-                         or is_state('sensor.nissan_charge_status', 'charging')
-                         or (plan.get('x', false) and not plan.get('k', false)) }}
-                    then:
-                      - action: switch.turn_off
+                          value: "{{ 'Charger timer armed for ' ~ outcome.start|timestamp_custom('%H:%M') }}"
+                      - action: input_text.set_value
                         target:
-                          entity_id: switch.nissan_charge
-                      - if: "{{ plan.get('x', false) and plan.get('h', 0) > 0 }}"
-                        then:
-                          - action: select.select_option
-                            continue_on_error: true
-                            target:
-                              entity_id: select.nissan_charge_charging_mode
-                            data:
-                              option: immediate
-                          - action: number.set_value
-                            continue_on_error: true
-                            target:
-                              entity_id: number.nissan_charge_delay
-                            data:
-                              value: 0
-                          - action: switch.turn_off
-                            target:
-                              entity_id: switch.nissan_charge
-                      - if: "{{ plan.get('x', false) }}"
+                          entity_id: input_text.leaf_next_charge_start
+                        data:
+                          value: "{{ outcome.start|timestamp_custom('%H:%M') }}"
+                    else:
+                      - if: "{{ decision.night and request not in ['Immediate to 80%', 'Immediate to 100%'] }}"
                         then:
                           - action: input_text.set_value
                             target:
                               entity_id: input_text.leaf_night_plan
                             data:
-                              value: '{{ dict(plan, k=true, q=false)|to_json }}'
-              - if: '{{ decision.reset }}'
-                then:
-                  - action: input_select.select_option
+                              value: '{{ dict(attempt_plan, x=true, l=false, h=0)|to_json }}'
+                      - if: "{{ request in ['Immediate to 80%', 'Immediate to 100%'] or not decision.night }}"
+                        then:
+                          - action: input_text.set_value
+                            target:
+                              entity_id: input_text.leaf_night_plan
+                            data:
+                              value: "{{ dict(attempt_plan, x=request in ['Immediate to 80%', 'Immediate to 100%'], l=false)|to_json }}"
+                else:
+                  - action: input_text.set_value
                     target:
-                      entity_id: input_select.leaf_charging_request
+                      entity_id: input_text.leaf_night_plan
                     data:
-                      option: Automatic
+                      value: '{{ dict(attempt_plan, x=true, l=true, u=as_timestamp(now())|int)|to_json }}'
+                  - action: input_text.set_value
+                    target:
+                      entity_id: input_text.leaf_charging_status
+                    data:
+                      value: Charger verification failed; recovery pending
+                  - action: input_text.set_value
+                    target:
+                      entity_id: input_text.leaf_next_charge_start
+                    data:
+                      value: Recovery pending
+              - action: homeassistant.save_persistent_states
+          - conditions: "{{ decision.get('recover', false) and not decision.get('failed', false) }}"
+            sequence:
+              - action: script.leaf_charger_write
+                data:
+                  operation: stop
+                  generation: '{{ generation }}'
+                  request: '{{ request }}'
+                  request_stamp: '{{ request_stamp }}'
+          - conditions: "{{ decision.get('failed', false) }}"
+            sequence:
+              - action: script.leaf_charger_write
+                data:
+                  operation: stop
+                  generation: '{{ generation }}'
+                  request: '{{ request }}'
+                  request_stamp: '{{ request_stamp }}'
+              - if: "{{ plan.get('j') != 'failed' }}"
+                then:
+                  - action: persistent_notification.create
+                    data:
+                      notification_id: leaf_charging_failure
+                      title: Leaf charging needs attention
+                      message: Charger recovery attempts exhausted. Check the charger and resume the required program.
+                  - action: input_text.set_value
+                    target:
+                      entity_id: input_text.leaf_night_plan
+                    data:
+                      value: "{{ dict(plan, g=generation, j='failed')|to_json }}"
         default:
-          - action: input_text.set_value
+          - if: >-
+              {{ not is_state('switch.nissan_charge', 'off')
+                 or (states('number.nissan_charge_delay')|float(0) > 0
+                   and (not enabled or not verified_unplugged
+                      or states('number.nissan_charge_delay')|int(0) != 12))
+                 or (plan.get('x', false) and not plan.get('k', false)) }}
+            then:
+              - action: script.leaf_charger_write
+                data:
+                  operation: stop
+                  generation: '{{ generation }}'
+                  request: '{{ request }}'
+                  request_stamp: '{{ request_stamp }}'
+              - if: "{{ plan.get('x', false) or request in ['Immediate to 80%', 'Immediate to 100%'] }}"
+                then:
+                  - action: input_text.set_value
+                    target:
+                      entity_id: input_text.leaf_night_plan
+                    data:
+                      value: '{{ dict(plan, g=generation, k=true, q=false)|to_json }}'
+      - if: '{{ decision.reset }}'
+        then:
+          - action: input_select.select_option
             target:
-              entity_id: input_text.leaf_next_charge_start
+              entity_id: input_select.leaf_charging_request
             data:
-              value: Disabled
-          - action: input_text.set_value
-            target:
-              entity_id: input_text.leaf_charging_status
-            data:
-              value: Disabled
+              option: Automatic
       - stop: Charging decision completed
         response_variable: decision
   leaf_refresh_soc:
@@ -691,75 +940,63 @@ scripts:
           - action: script.leaf_smart_charge_controller
             data:
               force_replan: '{{ force|default(false) }}'
+  leaf_request_program:
+    alias: Leaf Request Charging Program
+    mode: restart
+    sequence:
+      - condition: template
+        value_template: "{{ program in ['Automatic', 'Night to 100%', 'Immediate to 80%', 'Immediate to 100%'] }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.leaf_control_generation
+        data:
+          value: "{{ 'g' ~ (states('input_text.leaf_control_generation')[1:]|int(0) + 1) }}"
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.leaf_charging_request
+        data:
+          option: '{{ program }}'
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.leaf_smart_charging
+      - action: script.turn_on
+        target:
+          entity_id: script.leaf_refresh_soc
+        data:
+          variables:
+            force: true
   leaf_charge_80_immediately:
     alias: Leaf Charge to 80% Immediately
     icon: mdi:battery-80
     mode: single
     sequence:
-      - action: input_select.select_option
-        target:
-          entity_id: input_select.leaf_charging_request
+      - action: script.leaf_request_program
         data:
-          option: Immediate to 80%
-      - action: input_boolean.turn_on
-        target:
-          entity_id: input_boolean.leaf_smart_charging
-      - action: script.leaf_refresh_soc
-        data:
-          force: true
+          program: Immediate to 80%
   leaf_charge_100_immediately:
     alias: Leaf Charge to 100% Immediately
     icon: mdi:battery
     mode: single
     sequence:
-      - action: input_select.select_option
-        target:
-          entity_id: input_select.leaf_charging_request
+      - action: script.leaf_request_program
         data:
-          option: Immediate to 100%
-      - action: input_boolean.turn_on
-        target:
-          entity_id: input_boolean.leaf_smart_charging
-      - action: script.leaf_refresh_soc
-        data:
-          force: true
+          program: Immediate to 100%
   leaf_charge_100_overnight:
     alias: Leaf Charge to 100% Overnight
     icon: mdi:weather-night
     mode: single
     sequence:
-      - action: input_select.select_option
-        target:
-          entity_id: input_select.leaf_charging_request
+      - action: script.leaf_request_program
         data:
-          option: Night to 100%
-      - action: input_boolean.turn_on
-        target:
-          entity_id: input_boolean.leaf_smart_charging
-      - action: script.leaf_refresh_soc
-        data:
-          force: true
+          program: Night to 100%
   leaf_resume_automatic_charging:
     alias: Leaf Return to Planned Night Charging
     icon: mdi:calendar-clock
     mode: single
     sequence:
-      - action: input_text.set_value
-        target:
-          entity_id: input_text.leaf_night_plan
+      - action: script.leaf_request_program
         data:
-          value: '{}'
-      - action: input_select.select_option
-        target:
-          entity_id: input_select.leaf_charging_request
-        data:
-          option: Automatic
-      - action: input_boolean.turn_on
-        target:
-          entity_id: input_boolean.leaf_smart_charging
-      - action: script.leaf_refresh_soc
-        data:
-          force: true
+          program: Automatic
 automations:
   leaf_connection_observation:
     id: leaf_connection_observation
@@ -887,8 +1124,7 @@ automations:
   leaf_smart_charge_control:
     id: leaf_smart_charge_control
     alias: Leaf Smart Charge Control
-    mode: queued
-    max: 5
+    mode: restart
     trigger:
       - platform: time_pattern
         minutes: /1
@@ -897,21 +1133,31 @@ automations:
         entity_id:
           - sensor.leaf_battery_level
           - sensor.leaf_last_updated
-          - binary_sensor.nissan_charge_problem
+        to:
+        id: battery
+      - platform: state
+        entity_id: binary_sensor.nissan_charge_problem
+        to:
+        id: critical
+      - platform: state
+        entity_id:
           - switch.nissan_charge
           - number.nissan_charge_charge_current
           - number.nissan_charge_delay
           - select.nissan_charge_charging_mode
-        id: state
-      - platform: state
-        entity_id: sensor.nissan_charge_connection_state
-        id: connection
+          - sensor.nissan_charge_connection_state
+          - sensor.nissan_charge_status
+        to:
+        for: '00:00:02'
+        id: feedback
       - platform: state
         entity_id:
           - input_number.leaf_price_limit
           - input_number.leaf_charge_rate
           - input_select.leaf_charging_request
           - input_boolean.leaf_smart_charging
+          - input_text.leaf_control_generation
+        to:
         id: settings
       - platform: state
         entity_id: sensor.nordpool_kwh_fi_eur_3_10_0255
@@ -920,9 +1166,34 @@ automations:
         event: start
         id: startup
     action:
-      - action: script.leaf_smart_charge_controller
+      - if: >-
+           {{ trigger.id|default('manual') in ['settings', 'critical']
+             or not 8 <= states('number.nissan_charge_charge_current')|float(0) <= 16
+             or ((is_state('script.leaf_charger_write', 'on')
+                 or states('sensor.nissan_charge_power')|float(0) > 0.05)
+                and (not is_number(states('sensor.leaf_battery_level'))
+                   or not -120 <= as_timestamp(now())
+                     - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600))
+             or (trigger.id|default('manual') == 'battery'
+                and states('sensor.leaf_battery_level')|float(-1)
+                  >= (100 if states('input_select.leaf_charging_request') in
+                      ['Night to 100%', 'Immediate to 100%'] else 80)) }}
+        then:
+          - action: script.turn_off
+            target:
+              entity_id:
+                - script.leaf_smart_charge_controller
+                - script.leaf_charger_write
+      - condition: template
+        value_template: >-
+          {{ is_state('script.leaf_smart_charge_controller', 'off')
+             and is_state('script.leaf_charger_write', 'off') }}
+      - action: script.turn_on
+        target:
+          entity_id: script.leaf_smart_charge_controller
         data:
-          force_replan: "{{ trigger.id in ['settings', 'forecast', 'connection', 'startup'] }}"
+          variables:
+            force_replan: "{{ trigger.id|default('manual') in ['settings', 'forecast', 'startup'] }}"
   leaf_smart_charge_refresh:
     id: leaf_smart_charge_refresh
     alias: Leaf Smart Charge Refresh
@@ -955,8 +1226,8 @@ automations:
   leaf_smart_charge_reset:
     id: leaf_smart_charge_reset
     alias: Leaf Smart Charge Reset
-    mode: queued
-    max: 5
+    mode: single
+    max_exceeded: silent
     variables:
       verified_unplugged: *verified_unplugged
     trigger:
@@ -983,59 +1254,27 @@ automations:
       - condition: template
         value_template: >-
           {% set plan = states('input_text.leaf_night_plan')|from_json({}) %}
-          {% set timestamp = as_timestamp(now()) %}
-          {% set arming = is_state('script.leaf_smart_charge_controller', 'on')
-              and plan.get('h', 0) > 0 and timestamp < plan.get('a', 0) %}
-          {% set waiting = plan.get('x', false) and not plan.get('k', false)
-              and plan.get('h', 0) > 0
-              and (is_state('select.nissan_charge_charging_mode', 'delayed_charge')
-                  or plan.get('a', 0) <= timestamp < plan.get('a', 0) + 300)
-                and timestamp < [plan.get('e', 0), plan.get('a', 0) + 300]|min %}
-            {{ (trigger.id in ['disconnected', 'disabled']
-              or (trigger.id == 'disconnect_confirmation' and verified_unplugged
-                and (plan.get('x', false)
-                  or not is_state('input_select.leaf_charging_request', 'Automatic')))
-              or (trigger.id == 'morning' and is_state('input_select.leaf_charging_request', 'Night to 100%')))
-             and not (trigger.id == 'disconnected' and (arming or waiting)
-                  and not verified_unplugged) }}
+          {{ trigger.id == 'disabled'
+             or (trigger.id in ['disconnected', 'disconnect_confirmation']
+                 and verified_unplugged
+                 and (plan.get('x', false)
+                   or not is_state('input_select.leaf_charging_request', 'Automatic')))
+             or (trigger.id == 'morning'
+                 and is_state('input_select.leaf_charging_request', 'Night to 100%')) }}
     action:
-      - variables:
-          cancel_timer: "{{ (states('input_text.leaf_night_plan')|from_json({})).get('x', false) }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.leaf_control_generation
+        data:
+          value: "{{ 'g' ~ (states('input_text.leaf_control_generation')[1:]|int(0) + 1) }}"
       - action: input_select.select_option
         target:
           entity_id: input_select.leaf_charging_request
         data:
           option: Automatic
-      - action: input_text.set_value
+      - action: script.turn_on
         target:
-          entity_id: input_text.leaf_night_plan
-        data:
-          value: '{}'
-      - if: "{{ trigger.id in ['disconnected', 'disconnect_confirmation', 'disabled'] and (cancel_timer or is_state('switch.nissan_charge', 'on')) }}"
-        then:
-          - action: switch.turn_off
-            target:
-              entity_id: switch.nissan_charge
-          - if: '{{ cancel_timer }}'
-            then:
-              - action: select.select_option
-                continue_on_error: true
-                target:
-                  entity_id: select.nissan_charge_charging_mode
-                data:
-                  option: immediate
-              - action: number.set_value
-                continue_on_error: true
-                target:
-                  entity_id: number.nissan_charge_delay
-                data:
-                  value: 0
-              - action: switch.turn_off
-                target:
-                  entity_id: switch.nissan_charge
-      - action: script.leaf_smart_charge_controller
-        data:
-          force_replan: true
+          entity_id: script.leaf_smart_charge_controller
 program_status:
   name: Leaf Active Program
   entity_id: sensor.leaf_active_program

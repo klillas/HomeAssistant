@@ -143,6 +143,7 @@ entities:
       - id: 28
         type: integer
         name: value
+        force: true
         unit: h
         range:
           min: 0
