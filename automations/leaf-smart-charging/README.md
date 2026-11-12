@@ -74,10 +74,19 @@ own BMS remains the final authority; do not treat HA as an electrical safety dev
 
 Before issuing charging commands the controller checks charger fault data, control
 availability, configured current within 8-16 A, SOC range, and battery-report age.
-The battery freshness limit is 10 minutes, with a two-minute clock-skew allowance.
+The normal battery freshness limit is 10 minutes, with a two-minute clock-skew allowance.
+An existing complete overnight plan for the same program, target, and request
+generation may continue or start using its saved estimate when Nissan battery
+data becomes stale. Its saved finish time remains fixed, including during bounded
+timer recovery. HA stops the charger at that deadline even without a fresh battery
+report; the deadline is checked every minute. Without a valid saved overnight plan,
+fresh data is still required. Immediate programs do not use this exception.
+Fresh data reaching the target, a fault, disable, or confirmed disconnect still
+stops charging. The estimate can undercharge or exceed the requested SOC because
+it is not a measurement of the car's current battery level.
 Startup handover has a separate five-minute grace because mode/switch and pilot/
-power reports do not arrive simultaneously. Fault, disable, target, and battery
-freshness protections are not bypassed by that grace.
+power reports do not arrive simultaneously. That grace does not bypass the other
+charging guards or extend the saved finish time.
 
 ### Request Coordination and Recovery
 

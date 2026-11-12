@@ -30,6 +30,21 @@ templates:
       and -120 <= as_timestamp(now()) - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600
        and as_timestamp(states('sensor.leaf_last_updated'), 0)
            >= as_timestamp(states.sensor.nissan_charge_connection_state.last_changed, 0) }}
+  scheduled_finish: &scheduled_finish >-
+    {% set saved = states('input_text.leaf_night_plan')|from_json({}) %}
+    {% set selected = states('input_select.leaf_charging_request') %}
+    {% set selected_target = 100 if selected == 'Night to 100%' else 80 %}
+    {% set start = saved.get('s', 0)|float(0) %}
+    {% set end = saved.get('e', 0)|float(0) %}
+    {% set enabled_at = saved.get('a', 0)|float(0) %}
+    {% set finish = saved.get('z', 0)|float(0) %}
+    {{ finish if selected in ['Automatic', 'Night to 100%']
+        and saved.get('r') == selected and saved.get('t') == selected_target
+        and saved.get('g', 'base') == states('input_text.leaf_control_generation')
+        and saved.get('m') == 'continuous' and saved.get('v') == 3
+        and saved.get('c', false) and saved.get('x', false)
+        and not saved.get('k', false) and 0 < start <= enabled_at < finish <= end
+        else 0 }}
   planner: &planner >-
     {% set local = as_local(as_datetime(now_ts)) %}
     {% set evening = local.replace(hour=22, minute=0, second=0, microsecond=0) %}
@@ -167,7 +182,9 @@ templates:
       {% set ns.reason = 'Charger fault or fault data unavailable' %}
     {% elif not actuator_available %}
       {% set ns.reason = 'Charger controls unavailable' %}
-    {% elif not soc_valid or not fresh %}
+    {% elif scheduled_finish > 0 and now_ts >= scheduled_finish %}
+      {% set ns.reason = 'Scheduled night charging finished' %}
+    {% elif not soc_valid or (not fresh and not now_ts < scheduled_finish) %}
       {% if timer_armed and now_ts < start %}
         {% set ns.keep_timer = true %}
         {% set ns.reason = 'Charger timer armed for ' ~ start|timestamp_custom('%H:%M') %}
@@ -219,10 +236,11 @@ templates:
           {% set required = [0, (target - soc) / rate * 3600]|max %}
           {% set up = ((start - now_ts) / 3600)|round(0, 'ceil')|int %}
           {% set down = ((start - now_ts) / 3600)|int %}
-          {% set hours = up if now_ts + up * 3600 + required <= plan.e
+            {% set latest_finish = scheduled_finish if scheduled_finish > 0 else plan.e %}
+            {% set hours = up if now_ts + up * 3600 + required <= latest_finish
               or now_ts + down * 3600 < plan.s else down %}
           {% set candidate = (now_ts|int) + hours * 3600 %}
-          {% if 0 <= hours <= 12 and plan.s <= candidate < plan.e %}
+            {% if 0 <= hours <= 12 and plan.s <= candidate < latest_finish %}
             {% set ns.hours = hours %}
             {% set ns.selected_start = candidate %}
             {% set ns.arm = hours > 0 %}
@@ -270,6 +288,11 @@ templates:
           and not immediate and soc_valid and fresh and soc < target %}
       {% set ns.reason = ns.reason ~ '; estimated ' ~ plan.get('p', soc) ~ '% by 07:00' %}
     {% endif %}
+    {% if not fresh and now_ts < scheduled_finish
+        and (ns.charge or ns.arm or ns.keep_timer) %}
+      {% set ns.reason = ns.reason ~ '; battery data stale, scheduled finish '
+        ~ scheduled_finish|timestamp_custom('%H:%M') %}
+    {% endif %}
     {{ {'charge': ns.charge, 'reset': ns.reset, 'reason': ns.reason,
       'target': target, 'night': night, 'arm': ns.arm, 'keep_timer': ns.keep_timer,
       'recover': ns.recover, 'failed': ns.failed,
@@ -283,12 +306,14 @@ templates:
       Charger unavailable
     {% elif not soc_valid %}
       Waiting for battery data
-    {% elif not fresh and not decision.keep_timer %}
-      Waiting for fresh battery data
     {% elif soc >= target %}
       Target reached
     {% elif plan.get('k', false) %}
       Stopped - resume night charging
+    {% elif scheduled_finish > 0 and now_ts >= scheduled_finish %}
+      Finished
+    {% elif not fresh and not decision.keep_timer and not now_ts < scheduled_finish %}
+      Waiting for fresh battery data
     {% elif decision.get('failed', false) %}
       Failed - check charger
     {% elif decision.get('recover', false) %}
@@ -382,6 +407,7 @@ scripts:
           operation: "{{ operation|default('stop') }}"
           hours: '{{ hours|default(0)|int }}'
           target: "{{ 100 if request in ['Night to 100%', 'Immediate to 100%'] else 80 }}"
+          scheduled_finish: *scheduled_finish
           result:
             ok: false
             superseded: true
@@ -397,7 +423,9 @@ scripts:
                 or not 8 <= states('number.nissan_charge_charge_current')|float(0) <= 16
                 or not is_number(states('sensor.leaf_battery_level'))
                 or not 0 <= states('sensor.leaf_battery_level')|float(-1) < target
-                or not -120 <= as_timestamp(now()) - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600
+                or (scheduled_finish > 0 and as_timestamp(now()) >= scheduled_finish)
+                or (not -120 <= as_timestamp(now()) - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600
+                  and not as_timestamp(now()) < scheduled_finish)
                 or not (states('sensor.nissan_charge_connection_state') in
                     ['Vehicle detected', 'Vehicle connected', 'Ready to charge', 'charging']
                   or is_state('binary_sensor.leaf_plugged_in', 'on')))) }}
@@ -722,6 +750,7 @@ scripts:
                   or (plan.get('h', 0) > 0
                     and plan.get('a', 0) <= now_ts < [plan.get('e', 0), plan.get('a', 0) + 300]|min
                     and is_state('select.nissan_charge_charging_mode', 'immediate'))) }}
+          scheduled_finish: *scheduled_finish
           decision_json: *decision
           decision: '{{ decision_json|from_json }}'
           next_start: *next_start
@@ -789,7 +818,8 @@ scripts:
                           committed: >-
                             {{ dict(attempt_plan, x=true, l=false, h=decision.delay_hours,
                                 a=outcome.start,
-                                z=[plan.e, outcome.start + (target - soc) / rate * 3600]|min) }}
+                                z=scheduled_finish if scheduled_finish > 0
+                                  else [plan.e, outcome.start + (target - soc) / rate * 3600]|min) }}
                       - action: input_text.set_value
                         target:
                           entity_id: input_text.leaf_night_plan
@@ -1166,14 +1196,18 @@ automations:
         event: start
         id: startup
     action:
+      - variables:
+          scheduled_finish: *scheduled_finish
       - if: >-
            {{ trigger.id|default('manual') in ['settings', 'critical']
              or not 8 <= states('number.nissan_charge_charge_current')|float(0) <= 16
              or ((is_state('script.leaf_charger_write', 'on')
                  or states('sensor.nissan_charge_power')|float(0) > 0.05)
                 and (not is_number(states('sensor.leaf_battery_level'))
-                   or not -120 <= as_timestamp(now())
-                     - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600))
+                   or (not -120 <= as_timestamp(now())
+                       - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600
+                     and not as_timestamp(now()) < scheduled_finish)))
+             or (scheduled_finish > 0 and as_timestamp(now()) >= scheduled_finish)
              or (trigger.id|default('manual') == 'battery'
                 and states('sensor.leaf_battery_level')|float(-1)
                   >= (100 if states('input_select.leaf_charging_request') in
