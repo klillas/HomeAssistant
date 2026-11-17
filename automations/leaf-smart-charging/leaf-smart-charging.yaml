@@ -80,6 +80,16 @@ templates:
         {% endif %}
       {% endfor %}
       {% set complete = ns.seen|length == expected %}
+      {% if not complete and required > 0 %}
+        {% set candidate = ([start, now_ts]|max if start <= now_ts < end
+            and already_charging|default(false) else [start, now_ts, end - required]|max)|int %}
+        {% set seconds = [0, end - candidate]|max %}
+        {{ {'s': start, 'e': end, 'b': bucket, 't': target, 'i': [],
+        'c': true, 'f': seconds >= required,
+        'p': ([target, soc + seconds / 3600 * rate]|min)|round(1),
+        'm': 'continuous', 'v': 3, 'r': request, 'a': candidate,
+        'd': true}|to_json }}
+      {% else %}
       {% set rows = ns.rows|sort(attribute='index') %}
       {% set minimum_start = start <= now_ts < end and rows
           and (already_charging|default(false) or (soc < 20 and rows[0].price / 100 < limit)) %}
@@ -116,6 +126,7 @@ templates:
           'c': complete, 'f': complete and ns.seconds >= required,
           'p': ([soc, [target, soc + ns.seconds / 3600 * rate]|min]|max)|round(1),
           'm': 'continuous', 'v': 3, 'r': request}|to_json }}
+      {% endif %}
     {% endif %}
   timer_plan: &timer_plan >-
     {% set desired = initial_plan.get('a',
@@ -124,6 +135,17 @@ templates:
           or not (initial_plan.get('i') or initial_plan.get('a'))
           or desired - now_ts > 43200 or soc >= target %}
       {{ initial_plan|to_json }}
+      {% elif initial_plan.get('d', false) %}
+        {% set required = [0, (target - soc) / rate * 3600]|max %}
+        {% set up = ((desired - now_ts) / 3600)|round(0, 'ceil')|int %}
+        {% set down = ((desired - now_ts) / 3600)|int %}
+        {% set hours = up if now_ts + up * 3600 + required <= initial_plan.e
+          or now_ts + down * 3600 < initial_plan.s else down %}
+        {% set candidate = (now_ts|int) + hours * 3600 %}
+        {% set finish = [initial_plan.e, candidate + required]|min|int %}
+        {{ dict(initial_plan, a=candidate, z=finish, h=hours, x=false,
+          f=finish - candidate >= required,
+          p=([target, soc + (finish - candidate) / 3600 * rate]|min)|round(1))|to_json }}
     {% else %}
       {% set required = [0, (target - soc) / rate * 3600]|max %}
       {% set ns = namespace(chosen=none, cost=none, seconds=0, full=false, preferred=false) %}
@@ -287,6 +309,9 @@ templates:
     {% if enabled and connected and night and plan.get('c', false) and not plan.get('f', false)
           and not immediate and soc_valid and fresh and soc < target %}
       {% set ns.reason = ns.reason ~ '; estimated ' ~ plan.get('p', soc) ~ '% by 07:00' %}
+    {% endif %}
+    {% if plan.get('d', false) and (ns.charge or ns.arm or ns.keep_timer) %}
+      {% set ns.reason = ns.reason ~ '; price forecast unavailable' %}
     {% endif %}
     {% if not fresh and now_ts < scheduled_finish
         and (ns.charge or ns.arm or ns.keep_timer) %}

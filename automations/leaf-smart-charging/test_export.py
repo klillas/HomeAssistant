@@ -264,6 +264,64 @@ class ChargingBehaviorTests(unittest.TestCase):
         context = dict(self.context, **overrides)
         return json.loads(self.fixture.render(self.definition['templates']['decision'], context))
 
+    def fallback_plan(self, **overrides):
+        context = dict(now_ts=self.fixture.clock.timestamp(), old_plan={}, request='Automatic',
+                       target=80, soc=54, rate=8, raw_prices=[], force_replan=True,
+                       already_charging=False, limit=0.5)
+        context.update(overrides)
+        initial = json.loads(self.fixture.render(self.definition['templates']['planner'], context))
+        plan = json.loads(self.fixture.render(self.definition['templates']['timer_plan'],
+                                              dict(context, initial_plan=initial)))
+        return initial, plan
+
+    def test_missing_forecast_uses_deadline_and_rounds_timer_early(self):
+        for request, target in [('Automatic', 80), ('Night to 100%', 100)]:
+            with self.subTest(request=request):
+                initial, plan = self.fallback_plan(request=request, target=target)
+                required = (target - 54) / 8 * 3600
+                self.assertTrue(initial['d'])
+                self.assertTrue(plan['c'])
+                self.assertEqual(plan['a'], self.fixture.clock.timestamp() + plan['h'] * 3600)
+                self.assertGreaterEqual(plan['a'], plan['s'])
+                self.assertLessEqual(plan['a'] + required, plan['e'])
+                self.assertLessEqual(plan['z'], plan['e'])
+                self.assertTrue(plan['f'])
+
+    def test_fallback_starts_at_night_beginning_if_target_cannot_fit(self):
+        initial, plan = self.fallback_plan(soc=0, target=100, request='Night to 100%')
+        self.assertEqual(initial['a'], initial['s'])
+        self.assertGreaterEqual(plan['a'], plan['s'])
+        self.assertFalse(plan['f'])
+        self.assertLess(plan['p'], 100)
+
+    def test_partial_forecast_also_uses_deadline_fallback(self):
+        start = self.fixture.clock.replace(hour=22, minute=0)
+        prices = [dict(start=start.isoformat(), end=(start + timedelta(minutes=15)).isoformat(), value=1)]
+        initial, plan = self.fallback_plan(raw_prices=prices)
+        self.assertTrue(initial['d'])
+        self.assertTrue(plan['f'])
+
+    def test_already_charging_fallback_starts_now(self):
+        self.fixture.clock = self.fixture.clock.replace(hour=23)
+        initial, plan = self.fallback_plan(already_charging=True)
+        self.assertEqual(initial['a'], self.fixture.clock.timestamp())
+        self.assertEqual(plan['h'], 0)
+
+    def test_armed_fallback_is_preserved_when_forecast_changes(self):
+        _, plan = self.fallback_plan()
+        plan['x'] = True
+        initial, selected = self.fallback_plan(old_plan=plan, force_replan=True)
+        self.assertEqual(initial, plan)
+        self.assertEqual(selected, plan)
+
+    def test_unarmed_fallback_does_not_bypass_freshness_or_fault_checks(self):
+        _, plan = self.fallback_plan()
+        for overrides in [dict(fresh=False), dict(fault_clear=False), dict(connected=False)]:
+            with self.subTest(**overrides):
+                result = self.decision(plan=plan, **overrides)
+                self.assertFalse(result['arm'])
+                self.assertFalse(result['charge'])
+
     def test_lost_timer_recovers_within_original_window_even_at_high_price(self):
         result = self.decision()
         self.assertTrue(result['recover'])

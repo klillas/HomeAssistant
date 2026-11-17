@@ -45,6 +45,10 @@ Changing a charging program does not implicitly stop preheat.
 - Night 100% uses the same window and continuous-block policy with a 100% target.
 - Both overnight programs ignore the early-charge price cap. The planner still
   prefers the cheapest feasible block; price does not prohibit overnight charging.
+- If the overnight price forecast is incomplete, the planner instead schedules a
+  continuous block to finish the estimated target by 07:00, starting as early as
+  the charger timer permits within the night window if it cannot fit. This fallback
+  does not bypass the battery freshness, fault, connection, or charger-control guards.
 - Below 20%, an early top-up is allowed only when the current price is strictly
   below the adjustable early-charge cap. The initial setting used here is 50 c/kWh.
 - Immediate requests ignore prices but retain the availability, fault, SOC,
