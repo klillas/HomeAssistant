@@ -129,6 +129,7 @@ class NativeFixture:
         }
         self.stamps = {entity: self.clock for entity in self.values}
         self.writes = []
+        self.write_times = []
         self.after_write = lambda: None
         self.after_delay = lambda: None
         fixture = self
@@ -141,7 +142,8 @@ class NativeFixture:
                 class Domain:
                     def __getattr__(self, entity):
                         name = domain + '.' + entity
-                        return SimpleNamespace(last_changed=fixture.stamps.get(name, fixture.clock))
+                        stamp = fixture.stamps.get(name, fixture.clock)
+                        return SimpleNamespace(last_changed=stamp, last_updated=stamp)
                 return Domain()
 
         self.env = NativeEnvironment(undefined=StrictUndefined)
@@ -214,9 +216,10 @@ class NativeFixture:
                 self.after_delay()
             elif 'wait_template' in step:
                 completed = bool(self.render(step['wait_template'], variables))
-                if not completed:
-                    hours, minutes, seconds = map(int, step['timeout'].split(':'))
-                    self.clock += timedelta(hours=hours, minutes=minutes, seconds=seconds)
+                hours, minutes, seconds = map(int, step['timeout'].split(':'))
+                deadline = self.clock + timedelta(hours=hours, minutes=minutes, seconds=seconds)
+                while not completed and self.clock < deadline:
+                    self.clock = min(self.clock + timedelta(seconds=10), deadline)
                     self.after_delay()
                     completed = bool(self.render(step['wait_template'], variables))
                 variables['wait'] = {'completed': completed}
@@ -238,6 +241,7 @@ class NativeFixture:
                     value = data.get('value', data.get('option', 'on' if action.endswith('turn_on') else 'off'))
                     if entity.startswith(('switch.', 'select.', 'number.')):
                         self.writes.append((entity, value))
+                        self.write_times.append(self.clock)
                         self.values[entity] = str(value)
                         self.after_write()
                     else:
@@ -263,6 +267,145 @@ class ChargingBehaviorTests(unittest.TestCase):
     def decision(self, **overrides):
         context = dict(self.context, **overrides)
         return json.loads(self.fixture.render(self.definition['templates']['decision'], context))
+
+    def test_running_before_unarmed_night_plan_reports_schedule_mismatch(self):
+        plan = dict(self.plan, x=False)
+        result = self.decision(plan=plan, already_charging=True)
+        self.assertTrue(result['charge'] and result['keep_timer'])
+        self.assertIn('schedule not enforced', result['reason'])
+        for changes in [dict(soc=19), dict(request='Immediate to 80%'),
+                        dict(plan=self.plan), dict(already_charging=False)]:
+            with self.subTest(changes=changes):
+                context = dict(plan=plan, already_charging=True)
+                context.update(changes)
+                self.assertNotIn('schedule not enforced', self.decision(**context)['reason'])
+
+    def test_confirmed_early_charge_transitions_to_night_plan(self):
+        fixture = self.fixture
+        fixture.values.update({'switch.nissan_charge': 'on',
+                               'sensor.nissan_charge_power': '10.2',
+                               'sensor.nissan_charge_status': 'charging'})
+        result = fixture.run('leaf_smart_charge_controller')
+        self.assertTrue(result['arm'])
+        self.assertEqual([entity for entity, _ in fixture.writes],
+                         ['switch.nissan_charge', 'number.nissan_charge_delay',
+                          'select.nissan_charge_charging_mode', 'switch.nissan_charge',
+                          'persistent_notification.create'])
+        self.assertTrue(all((later - earlier).total_seconds() >= 30
+                            for earlier, later in zip(fixture.write_times, fixture.write_times[1:])))
+        self.assertTrue(json.loads(fixture.values['input_text.leaf_night_plan'])['l'])
+        self.assertIn('unverified', fixture.values['input_text.leaf_charging_status'])
+        fixture.writes.clear()
+        result = fixture.run('leaf_smart_charge_controller')
+        self.assertTrue(result['keep_timer'])
+        self.assertIn('unverified', result['reason'])
+        self.assertFalse(fixture.writes)
+
+    def test_uncertain_early_charge_and_existing_timer_are_preserved(self):
+        self.fixture.values.update({'switch.nissan_charge': 'on',
+                                    'sensor.nissan_charge_power': '10.2',
+                                    'sensor.nissan_charge_status': 'charging'})
+        plan = dict(self.plan, x=False)
+        for changes in [dict(fresh=False), dict(fault_clear=False), dict(connected=False),
+                        dict(actuator_available=False), dict(soc_valid=False), dict(soc=19),
+                        dict(plan=self.plan), dict(request='Immediate to 80%')]:
+            with self.subTest(changes=changes):
+                context = dict(plan=plan, already_charging=True)
+                context.update(changes)
+                result = self.decision(**context)
+                self.assertFalse(result['arm'])
+                self.assertTrue(result['keep_timer'])
+        self.fixture.stamps['sensor.nissan_charge_power'] = self.fixture.clock - timedelta(minutes=11)
+        result = self.decision(plan=plan, already_charging=True)
+        self.assertFalse(result['arm'])
+        self.assertTrue(result['keep_timer'])
+        self.fixture.stamps['sensor.nissan_charge_power'] = self.fixture.clock
+        self.fixture.values['sensor.nissan_charge_status'] = 'available'
+        result = self.decision(plan=plan, already_charging=True)
+        self.assertFalse(result['arm'])
+        self.assertTrue(result['keep_timer'])
+
+    def test_inconsistent_connection_and_stale_battery_preserve_active_charge(self):
+        fixture, plan = self.stale_overnight_fixture()
+        fixture.values.update({'sensor.nissan_charge_connection_state': 'standby',
+                               'sensor.nissan_charge_status': 'charging',
+                               'sensor.nissan_charge_power': '0',
+                               'binary_sensor.nissan_charge_problem': 'unavailable'})
+        result = fixture.run('leaf_smart_charge_controller')
+        self.assertTrue(result['keep_timer'])
+        self.assertFalse(fixture.writes)
+        self.assertFalse(json.loads(fixture.values['input_text.leaf_night_plan']).get('k', False))
+        self.assertEqual(json.loads(fixture.values['input_text.leaf_night_plan'])['z'], plan['z'])
+
+    def test_fresh_target_and_explicit_fault_still_stop(self):
+        for changes in [{'sensor.leaf_battery_level': '80'},
+                        {'binary_sensor.nissan_charge_problem': 'on'}]:
+            with self.subTest(changes=changes):
+                fixture, _ = self.stale_overnight_fixture()
+                fixture.values['sensor.leaf_last_updated'] = fixture.clock.isoformat()
+                fixture.values.update(changes)
+                result = fixture.run('leaf_smart_charge_controller')
+                self.assertFalse(result['keep_timer'])
+                self.assertEqual(fixture.values['switch.nissan_charge'], 'off')
+
+    def test_immediate_without_estimate_survives_missing_data(self):
+        fixture = self.fixture
+        fixture.values.update({'input_select.leaf_charging_request': 'Immediate to 100%',
+                               'input_text.leaf_night_plan': json.dumps({'r': 'Immediate to 100%',
+                                                                         't': 100, 'x': True, 'g': 'base'}),
+                               'switch.nissan_charge': 'on',
+                               'sensor.leaf_battery_level': 'unavailable',
+                               'sensor.leaf_last_updated': 'unavailable'})
+        result = fixture.run('leaf_smart_charge_controller')
+        self.assertTrue(result['keep_timer'])
+        self.assertFalse(fixture.writes)
+
+    def test_stale_target_and_missing_controls_do_not_stop_charge(self):
+        for changes in [{'sensor.leaf_battery_level': '80'},
+                        {'sensor.leaf_battery_level': 'unavailable'},
+                        {'number.nissan_charge_charge_current': 'unavailable'},
+                        {'binary_sensor.leaf_plugged_in': 'unavailable'},
+                        {'select.nissan_charge_charging_mode': 'unavailable'}]:
+            with self.subTest(changes=changes):
+                self.fixture = NativeFixture(self.definition)
+                fixture, _ = self.stale_overnight_fixture()
+                fixture.values.update(changes)
+                result = fixture.run('leaf_smart_charge_controller')
+                self.assertTrue(result['keep_timer'])
+                self.assertFalse(fixture.writes)
+
+    def test_startup_verification_timeout_does_not_turn_off(self):
+        result = self.fixture.run('leaf_charger_write', operation='charge')
+        self.assertFalse(result['ok'])
+        self.assertEqual(self.fixture.values['switch.nissan_charge'], 'on')
+        self.assertNotIn(('switch.nissan_charge', 'off'), self.fixture.writes)
+
+    def test_startup_feedback_after_fifteen_minutes_is_accepted(self):
+        fixture = self.fixture
+        fixture.values['input_select.leaf_charging_request'] = 'Immediate to 80%'
+        initial = fixture.clock
+        def report_charging():
+            if (fixture.clock - initial).total_seconds() >= 900:
+                fixture.values['sensor.nissan_charge_power'] = '10.2'
+        fixture.after_delay = report_charging
+        result = fixture.run('leaf_charger_write', operation='charge')
+        self.assertTrue(result['ok'])
+        self.assertEqual(fixture.writes, [('switch.nissan_charge', 'on')])
+        self.assertGreaterEqual((fixture.clock - initial).total_seconds(), 900)
+
+    def test_running_night_charge_gets_a_fixed_estimate_without_commands(self):
+        fixture, _ = self.stale_overnight_fixture()
+        fixture.values.update({'input_text.leaf_night_plan': '{}',
+                               'sensor.leaf_last_updated': fixture.clock.isoformat()})
+        result = fixture.run('leaf_smart_charge_controller')
+        plan = json.loads(fixture.values['input_text.leaf_night_plan'])
+        self.assertTrue(result['keep_timer'] and plan['x'])
+        self.assertGreater(plan['z'], fixture.clock.timestamp())
+        self.assertFalse(fixture.writes)
+        fixture.clock += timedelta(minutes=1)
+        fixture.run('leaf_smart_charge_controller')
+        self.assertEqual(json.loads(fixture.values['input_text.leaf_night_plan'])['z'], plan['z'])
+        self.assertFalse(fixture.writes)
 
     def fallback_plan(self, **overrides):
         context = dict(now_ts=self.fixture.clock.timestamp(), old_plan={}, request='Automatic',
@@ -322,22 +465,20 @@ class ChargingBehaviorTests(unittest.TestCase):
                 self.assertFalse(result['arm'])
                 self.assertFalse(result['charge'])
 
-    def test_lost_timer_recovers_within_original_window_even_at_high_price(self):
+    def test_uncertain_timer_is_preserved_without_rearming(self):
         result = self.decision()
-        self.assertTrue(result['recover'])
-        self.assertTrue(result['arm'])
-        self.assertLess(result['start'], self.plan['e'])
-        self.assertGreaterEqual(result['start'], self.plan['s'])
-        self.assertEqual(result['delay_hours'], 6)
+        self.assertTrue(result['keep_timer'])
+        self.assertFalse(result['recover'] or result['arm'])
 
     def test_recovery_is_bounded_and_intentional_stops_never_retry(self):
         for change in [dict(k=True), dict(n=2), dict(e=self.context['now_ts'] - 1)]:
             with self.subTest(change=change):
                 result = self.decision(plan=dict(self.plan, **change))
                 self.assertFalse(result['arm'] or result['charge'])
-        self.assertTrue(self.decision(plan=dict(self.plan, n=2))['failed'])
+        self.assertTrue(self.decision(plan=dict(self.plan, n=2))['keep_timer'])
         pending = self.decision(plan=dict(self.plan, u=self.context['now_ts'] - 10))
-        self.assertTrue(pending['recover'])
+        self.assertTrue(pending['keep_timer'])
+        self.assertFalse(pending['recover'])
         self.assertFalse(pending['arm'] or pending['charge'])
 
     def test_each_safety_gate_prevents_recovery(self):
@@ -352,15 +493,16 @@ class ChargingBehaviorTests(unittest.TestCase):
         context = dict(self.context, now_ts=self.plan['a'] + 60)
         context['decision'] = self.decision(now_ts=context['now_ts'], timer_armed=True)
         result = self.fixture.render(self.definition['templates']['next_start'], context)
-        self.assertIn('waiting for charger startup', result)
+        self.assertIn('awaiting reliable feedback', result)
         context['plan'] = dict(self.plan, k=True)
+        context['decision'] = self.decision(plan=context['plan'], now_ts=context['now_ts'])
         result = self.fixture.render(self.definition['templates']['next_start'], context)
         self.assertIn('Stopped', result)
 
-    def test_late_missing_power_uses_recovery_not_permanent_startup_grace(self):
+    def test_late_missing_power_preserves_charge_without_retry(self):
         result = self.decision(now_ts=self.plan['a'] + 301)
-        self.assertTrue(result['recover'] and result['charge'])
-        self.assertEqual(result['delay_hours'], 0)
+        self.assertTrue(result['keep_timer'])
+        self.assertFalse(result['recover'] or result['charge'])
 
     def test_old_generation_and_aba_request_cannot_write_after_intent_changes(self):
         programs = ['Immediate to 100%', 'Automatic', 'Immediate to 80%',
@@ -380,23 +522,101 @@ class ChargingBehaviorTests(unittest.TestCase):
                 self.assertEqual(fixture.writes, [('switch.nissan_charge', 'off')])
 
     def test_unstable_acknowledgement_is_not_committed(self):
-        initial = self.fixture.clock
-        def delayed_bad_feedback():
-            if (self.fixture.clock - initial).total_seconds() >= 6:
-                self.fixture.values['number.nissan_charge_delay'] = '0'
-        self.fixture.after_delay = delayed_bad_feedback
-        result = self.fixture.run('leaf_charger_write', operation='arm', hours=6)
-        self.assertFalse(result['ok'])
-        self.assertEqual(self.fixture.values['switch.nissan_charge'], 'off')
-        self.assertEqual(self.fixture.values['select.nissan_charge_charging_mode'], 'immediate')
-        self.assertEqual(self.fixture.values['number.nissan_charge_delay'], '0')
+        feedback_changes = [
+            ('number.nissan_charge_delay', '0'),
+            ('select.nissan_charge_charging_mode', 'immediate'),
+            ('sensor.nissan_charge_power', '10'),
+            ('sensor.nissan_charge_status', 'charging'),
+        ]
+        for revert_after, (entity, value) in [(seconds, change) for seconds in [6, 31]
+                                              for change in feedback_changes]:
+            with self.subTest(revert_after=revert_after, entity=entity):
+                fixture = NativeFixture(self.definition)
+                enabled_at = [None]
+                def record_enable():
+                    if fixture.writes[-1] == ('switch.nissan_charge', 'on'):
+                        enabled_at[0] = fixture.clock
+                def delayed_bad_feedback():
+                    if enabled_at[0] and (fixture.clock - enabled_at[0]).total_seconds() >= revert_after:
+                        fixture.values[entity] = value
+                fixture.after_write = record_enable
+                fixture.after_delay = delayed_bad_feedback
+                result = fixture.run('leaf_charger_write', operation='arm', hours=6)
+                self.assertFalse(result['ok'])
+                self.assertEqual(fixture.values['switch.nissan_charge'], 'on')
 
-    def test_stable_acknowledgement_requires_ten_seconds(self):
+    def test_stable_acknowledgement_requires_forty_seconds(self):
         initial = self.fixture.clock
         result = self.fixture.run('leaf_charger_write', operation='arm', hours=6)
         self.assertTrue(result['ok'])
-        self.assertEqual((self.fixture.clock - initial).total_seconds(), 10)
-        self.assertEqual(result['start'], initial.timestamp() + 21600)
+        self.assertEqual((self.fixture.clock - initial).total_seconds(), 160)
+        self.assertEqual(result['start'], self.fixture.write_times[-1].timestamp() + 21600)
+
+    def test_charger_commands_are_spaced_and_stop_is_immediate(self):
+        for operation, hours in [('arm', 6), ('charge', 0), ('stop', 0)]:
+            with self.subTest(operation=operation):
+                fixture = NativeFixture(self.definition)
+                fixture.values.update({'switch.nissan_charge': 'on',
+                                       'select.nissan_charge_charging_mode': 'delayed_charge',
+                                       'number.nissan_charge_delay': '12'})
+                initial = fixture.clock
+                fixture.run('leaf_charger_write', operation=operation, hours=hours)
+                self.assertGreaterEqual(len(fixture.write_times), 2)
+                self.assertTrue(all((later - earlier).total_seconds() >= 30
+                                    for earlier, later in zip(fixture.write_times, fixture.write_times[1:])))
+                if operation == 'stop':
+                    self.assertEqual(fixture.writes[0], ('switch.nissan_charge', 'off'))
+                    self.assertEqual(fixture.write_times[0], initial)
+
+    def test_fault_during_settling_prevents_further_arming_commands(self):
+        self.fixture.after_delay = lambda: self.fixture.values.update(
+            {'binary_sensor.nissan_charge_problem': 'on'})
+        result = self.fixture.run('leaf_charger_write', operation='arm', hours=6)
+        self.assertTrue(result['superseded'])
+        self.assertEqual(self.fixture.writes, [('switch.nissan_charge', 'off')])
+
+    def test_idle_feedback_may_arrive_after_timer_commands(self):
+        fixture = self.fixture
+        fixture.values.update({'switch.nissan_charge': 'on',
+                               'sensor.nissan_charge_power': '10.2',
+                               'sensor.nissan_charge_status': 'charging'})
+        enabled_at = [None]
+        def record_enable():
+            if fixture.writes[-1] == ('switch.nissan_charge', 'on'):
+                enabled_at[0] = fixture.clock
+        def report_idle():
+            if enabled_at[0] and (fixture.clock - enabled_at[0]).total_seconds() >= 60:
+                fixture.values.update({'sensor.nissan_charge_power': '0',
+                                       'sensor.nissan_charge_status': 'plugged_in',
+                                       'sensor.leaf_last_updated': fixture.clock.isoformat()})
+        fixture.after_write = record_enable
+        fixture.after_delay = report_idle
+        result = fixture.run('leaf_charger_write', operation='arm', hours=6)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['start'], enabled_at[0].timestamp() + 21600)
+        self.assertEqual(len(fixture.write_times), 4)
+
+    def test_idle_feedback_after_ten_minutes_is_accepted(self):
+        fixture = self.fixture
+        fixture.values.update({'switch.nissan_charge': 'on',
+                               'sensor.nissan_charge_power': '10.2',
+                               'sensor.nissan_charge_status': 'charging',
+                               'input_text.leaf_night_plan': json.dumps(self.plan)})
+        enabled_at = [None]
+        def record_enable():
+            if fixture.writes[-1] == ('switch.nissan_charge', 'on'):
+                enabled_at[0] = fixture.clock
+        def report_idle():
+            if enabled_at[0] and (fixture.clock - enabled_at[0]).total_seconds() >= 600:
+                fixture.values.update({'sensor.nissan_charge_power': '0',
+                                       'sensor.nissan_charge_status': 'plugged_in'})
+        fixture.after_write = record_enable
+        fixture.after_delay = report_idle
+        result = fixture.run('leaf_charger_write', operation='arm', hours=6)
+        self.assertTrue(result['ok'])
+        self.assertGreaterEqual((fixture.clock - enabled_at[0]).total_seconds(), 600)
+        self.assertEqual(result['start'], enabled_at[0].timestamp() + 21600)
+        self.assertEqual(len(fixture.write_times), 4)
 
     def test_safety_changes_during_arming_abort_before_further_commands(self):
         for entity, value in [('binary_sensor.nissan_charge_problem', 'on'),
@@ -427,6 +647,33 @@ class ChargingBehaviorTests(unittest.TestCase):
         result = self.fixture.run('leaf_smart_charge_controller')
         self.assertFalse(result['charge'] or result['arm'])
         self.assertFalse(self.fixture.writes)
+
+    def test_idle_delay_can_be_restored_when_value_is_unknown(self):
+        self.fixture.stamps['sensor.nissan_charge_connection_state'] = self.fixture.clock - timedelta(seconds=30)
+        self.fixture.values.update({'sensor.nissan_charge_connection_state': 'standby',
+                                    'binary_sensor.leaf_plugged_in': 'off',
+                                    'number.nissan_charge_delay': 'unknown'})
+        self.fixture.run('leaf_set_idle_charge_delay')
+        self.assertEqual(self.fixture.writes, [('number.nissan_charge_delay', 11),
+                                              ('number.nissan_charge_delay', 12),
+                                              ('select.nissan_charge_charging_mode', 'delayed_charge')])
+        self.assertTrue(all((later - earlier).total_seconds() >= 30
+                    for earlier, later in zip(self.fixture.write_times, self.fixture.write_times[1:])))
+
+    def test_idle_delay_never_restored_when_charging_or_unavailable(self):
+        for changes in [{'number.nissan_charge_delay': 'unavailable'},
+                        {'binary_sensor.leaf_plugged_in': 'on'},
+                        {'switch.nissan_charge': 'on'},
+                        {'sensor.nissan_charge_power': '10'}]:
+            with self.subTest(changes=changes):
+                fixture = NativeFixture(self.definition)
+                fixture.stamps['sensor.nissan_charge_connection_state'] = fixture.clock - timedelta(seconds=30)
+                fixture.values.update({'sensor.nissan_charge_connection_state': 'standby',
+                                       'binary_sensor.leaf_plugged_in': 'off',
+                                       'number.nissan_charge_delay': 'unknown'})
+                fixture.values.update(changes)
+                fixture.run('leaf_set_idle_charge_delay')
+                self.assertFalse(fixture.writes)
 
     def test_recovered_and_failed_plans_fit_persistent_helper(self):
         for attempts in [0, 2]:
@@ -494,7 +741,7 @@ class ChargingBehaviorTests(unittest.TestCase):
         result = fixture.run('leaf_smart_charge_controller')
         self.assertFalse(result['charge'] or result['arm'])
 
-    def test_stale_battery_allows_bounded_start_without_extending_finish(self):
+    def test_stale_battery_does_not_restart_uncertain_charge(self):
         fixture, plan = self.stale_overnight_fixture()
         fixture.values.update({'sensor.nissan_charge_power': '0',
                                'sensor.nissan_charge_status': 'plugged_in',
@@ -506,13 +753,14 @@ class ChargingBehaviorTests(unittest.TestCase):
         fixture.after_write = acknowledge_start
         result = fixture.run('leaf_smart_charge_controller')
         resumed = json.loads(fixture.values['input_text.leaf_night_plan'])
-        self.assertTrue(result['charge'] and result['recover'])
-        self.assertEqual(resumed['n'], 1)
+        self.assertTrue(result['keep_timer'])
+        self.assertFalse(result['charge'] or result['recover'])
+        self.assertEqual(resumed['n'], 0)
         self.assertEqual(resumed['z'], plan['z'])
         self.assertFalse(resumed.get('k', False) or resumed.get('l', False))
-        self.assertEqual(fixture.values['switch.nissan_charge'], 'on')
+        self.assertFalse(fixture.writes)
 
-    def test_stale_battery_needs_matching_complete_saved_overnight_plan(self):
+    def test_missing_valid_deadline_does_not_stop_existing_charge(self):
         for change in [dict(x=False), dict(c=False), dict(g='another'), dict(k=True),
                        dict(t=100), dict(z=0), dict(z='unknown'), dict(a=0),
                        dict(z=self.context['now_ts'] + 999999)]:
@@ -520,8 +768,8 @@ class ChargingBehaviorTests(unittest.TestCase):
                 fixture, plan = self.stale_overnight_fixture()
                 fixture.values['input_text.leaf_night_plan'] = json.dumps(dict(plan, **change))
                 result = fixture.run('leaf_smart_charge_controller')
-                self.assertFalse(result['charge'] or result['arm'] or result['keep_timer'])
-                self.assertEqual(fixture.values['switch.nissan_charge'], 'off')
+                self.assertTrue(result['keep_timer'])
+                self.assertFalse(fixture.writes)
 
     def test_stale_battery_fallback_preserves_other_safety_stops(self):
         for changes in [{'binary_sensor.nissan_charge_problem': 'on'},
@@ -566,7 +814,7 @@ class ChargingBehaviorTests(unittest.TestCase):
         self.assertTrue(result['charge'] and result['keep_timer'])
         self.assertFalse(fixture.writes)
 
-    def test_stale_battery_timer_rearming_keeps_original_finish(self):
+    def test_stale_battery_preserves_timer_without_rearming(self):
         fixture, plan = self.stale_overnight_fixture()
         plan.update(a=fixture.clock.timestamp() + 3600, h=1)
         fixture.values.update({'input_text.leaf_night_plan': json.dumps(plan),
@@ -574,7 +822,9 @@ class ChargingBehaviorTests(unittest.TestCase):
                                'sensor.nissan_charge_status': 'plugged_in',
                                'switch.nissan_charge': 'off'})
         result = fixture.run('leaf_smart_charge_controller')
-        self.assertTrue(result['arm'] and result['recover'])
+        self.assertTrue(result['keep_timer'])
+        self.assertFalse(result['arm'] or result['recover'])
+        self.assertFalse(fixture.writes)
         self.assertEqual(json.loads(fixture.values['input_text.leaf_night_plan'])['z'], plan['z'])
 
     def test_stale_battery_writer_refuses_new_start_at_saved_finish(self):
@@ -585,18 +835,19 @@ class ChargingBehaviorTests(unittest.TestCase):
         self.assertTrue(result['superseded'])
         self.assertFalse(fixture.writes)
 
-    def test_retry_cooldown_clears_unexpected_output_without_latching_stop(self):
+    def test_uncertain_output_is_preserved_without_latching_stop(self):
         self.fixture.values['input_text.leaf_night_plan'] = json.dumps(
             dict(self.plan, u=self.context['now_ts']))
         self.fixture.values.update({'switch.nissan_charge': 'on',
                                     'sensor.nissan_charge_power': '10.25'})
         result = self.fixture.run('leaf_smart_charge_controller')
-        self.assertTrue(result['recover'])
-        self.assertFalse(result['charge'] or result['arm'])
-        self.assertEqual(self.fixture.values['switch.nissan_charge'], 'off')
+        self.assertTrue(result['keep_timer'])
+        self.assertFalse(result['recover'] or result['arm'])
+        self.assertEqual(self.fixture.values['switch.nissan_charge'], 'on')
+        self.assertFalse(self.fixture.writes)
         self.assertFalse(json.loads(self.fixture.values['input_text.leaf_night_plan']).get('k', False))
 
-    def test_busy_writer_missing_response_is_a_recoverable_failure(self):
+    def test_preserved_plan_does_not_call_busy_writer(self):
         self.fixture.values['input_text.leaf_night_plan'] = json.dumps(self.plan)
         original_run = self.fixture.run
         def busy_writer(script, **variables):
@@ -606,7 +857,7 @@ class ChargingBehaviorTests(unittest.TestCase):
         self.fixture.run = busy_writer
         self.fixture.run('leaf_smart_charge_controller')
         pending = json.loads(self.fixture.values['input_text.leaf_night_plan'])
-        self.assertTrue(pending['l'])
+        self.assertTrue(pending['x'])
         self.assertFalse(pending.get('k', False))
         self.assertFalse(self.fixture.writes)
 

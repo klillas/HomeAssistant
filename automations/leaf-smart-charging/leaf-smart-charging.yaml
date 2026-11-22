@@ -19,7 +19,7 @@ templates:
        and is_state('binary_sensor.nissan_charge_problem', 'off')
        and not (plan.get('x', false) and not plan.get('k', false)) and not arming
        and has_value('select.nissan_charge_charging_mode')
-       and is_number(states('number.nissan_charge_delay'))
+      and states('number.nissan_charge_delay') != 'unavailable'
        and is_state('sensor.nissan_charge_connection_state', 'standby')
        and is_state('sensor.nissan_charge_status', 'available')
        and is_state('switch.nissan_charge', 'off')
@@ -198,14 +198,49 @@ templates:
       reason='Waiting for 22:00') %}
     {% if not enabled %}
       {% set ns.reason = 'Disabled' %}
+    {% elif is_state('binary_sensor.nissan_charge_problem', 'on') %}
+      {% set ns.reason = 'Charger fault reported' %}
+    {% elif scheduled_finish > 0 and now_ts >= scheduled_finish %}
+      {% set ns.reason = 'Scheduled night charging finished' %}
+    {% elif soc_valid and fresh and soc >= target %}
+      {% set ns.reason = 'Target reached (' ~ target ~ '%)' %}
+      {% set ns.reset = request != 'Automatic' %}
+    {% elif not immediate and not night and not plan.get('x', false)
+        and not plan.get('k', false) and not plan.get('q', false)
+        and plan.get('c', false) and 1 <= plan.get('h', 0) <= 12
+        and now_ts < start and soc_valid and fresh and 20 <= soc < target
+        and connected and fault_clear and actuator_available and already_charging
+        and is_state('switch.nissan_charge', 'on')
+        and is_state('select.nissan_charge_charging_mode', 'immediate')
+        and is_state('sensor.nissan_charge_status', 'charging')
+        and is_number(states('sensor.nissan_charge_power'))
+        and states('sensor.nissan_charge_power')|float(0) > 0.05
+        and -120 <= now_ts - as_timestamp(states.sensor.nissan_charge_power.last_updated, 0) <= 600 %}
+      {% set ns.arm = true %}
+      {% set ns.reason = 'Applying planned night charging for ' ~ start|timestamp_custom('%H:%M') %}
+    {% elif plan.get('x', false) and not plan.get('k', false) and plan.get('l', false) %}
+      {% set ns.keep_timer = true %}
+      {% set ns.charge = already_charging %}
+      {% set ns.reason = 'Charger state unverified; check charger' %}
+    {% elif (plan.get('x', false) and not plan.get('k', false))
+      or already_charging or is_state('switch.nissan_charge', 'on')
+      or not connected or not fault_clear or not actuator_available
+      or not soc_valid or not fresh %}
+      {% set ns.keep_timer = true %}
+      {% set ns.charge = already_charging %}
+      {% if already_charging and not immediate and not plan.get('x', false)
+            and plan.get('c', false) and start > now_ts and soc_valid and soc >= 20 %}
+        {% set ns.reason = 'Charger reports charging before planned start; schedule not enforced' %}
+      {% else %}
+        {% set ns.reason = ('Charging to ' ~ target ~ '%' if already_charging else
+          'Charge or timer preserved; awaiting reliable feedback') %}
+      {% endif %}
     {% elif not connected %}
       {% set ns.reason = 'Car disconnected or charger connection unavailable' %}
     {% elif not fault_clear %}
       {% set ns.reason = 'Charger fault or fault data unavailable' %}
     {% elif not actuator_available %}
       {% set ns.reason = 'Charger controls unavailable' %}
-    {% elif scheduled_finish > 0 and now_ts >= scheduled_finish %}
-      {% set ns.reason = 'Scheduled night charging finished' %}
     {% elif not soc_valid or (not fresh and not now_ts < scheduled_finish) %}
       {% if timer_armed and now_ts < start %}
         {% set ns.keep_timer = true %}
@@ -213,9 +248,6 @@ templates:
       {% else %}
         {% set ns.reason = 'Waiting for fresh Nissan battery data' %}
       {% endif %}
-    {% elif soc >= target %}
-      {% set ns.reason = 'Target reached (' ~ target ~ '%)' %}
-      {% set ns.reset = request != 'Automatic' %}
     {% elif plan.get('k', false) %}
       {% set ns.reason = 'Charging stopped; select the required program to resume' %}
     {% elif immediate %}
@@ -325,18 +357,24 @@ templates:
   next_start: &next_start >-
     {% if not enabled %}
       Disabled
+    {% elif is_state('binary_sensor.nissan_charge_problem', 'on') %}
+      Charger fault
+    {% elif scheduled_finish > 0 and now_ts >= scheduled_finish %}
+      Finished
+    {% elif soc_valid and fresh and soc >= target %}
+      Target reached
+    {% elif plan.get('x', false) and not plan.get('k', false) and plan.get('l', false) %}
+      Charger state unverified; check charger
+    {% elif decision.keep_timer %}
+      {{ 'Charging' if already_charging else decision.reason }}
     {% elif not connected %}
       Not connected
     {% elif not fault_clear or not actuator_available %}
       Charger unavailable
     {% elif not soc_valid %}
       Waiting for battery data
-    {% elif soc >= target %}
-      Target reached
     {% elif plan.get('k', false) %}
       Stopped - resume night charging
-    {% elif scheduled_finish > 0 and now_ts >= scheduled_finish %}
-      Finished
     {% elif not fresh and not decision.keep_timer and not now_ts < scheduled_finish %}
       Waiting for fresh battery data
     {% elif decision.get('failed', false) %}
@@ -433,6 +471,7 @@ scripts:
           hours: '{{ hours|default(0)|int }}'
           target: "{{ 100 if request in ['Night to 100%', 'Immediate to 100%'] else 80 }}"
           scheduled_finish: *scheduled_finish
+          startup_verify: false
           result:
             ok: false
             superseded: true
@@ -450,7 +489,7 @@ scripts:
                 or not 0 <= states('sensor.leaf_battery_level')|float(-1) < target
                 or (scheduled_finish > 0 and as_timestamp(now()) >= scheduled_finish)
                 or (not -120 <= as_timestamp(now()) - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600
-                  and not as_timestamp(now()) < scheduled_finish)
+                  and not as_timestamp(now()) < scheduled_finish and not startup_verify)
                 or not (states('sensor.nissan_charge_connection_state') in
                     ['Vehicle detected', 'Vehicle connected', 'Ready to charge', 'charging']
                   or is_state('binary_sensor.leaf_plugged_in', 'on')))) }}
@@ -467,6 +506,9 @@ scripts:
                   entity_id: number.nissan_charge_delay
                 data:
                   value: 11
+              - &charger_settle
+                delay:
+                  seconds: 30
               - *transaction_guard
               - condition: template
                 value_template: *idle_delay_allowed
@@ -475,6 +517,7 @@ scripts:
                   entity_id: number.nissan_charge_delay
                 data:
                   value: 12
+              - *charger_settle
               - *transaction_guard
               - condition: template
                 value_template: *idle_delay_allowed
@@ -483,6 +526,7 @@ scripts:
                   entity_id: select.nissan_charge_charging_mode
                 data:
                   option: delayed_charge
+              - *charger_settle
           - conditions: "{{ operation == 'stop' }}"
             sequence: &stop_transaction
               - *transaction_guard
@@ -491,6 +535,7 @@ scripts:
                   - action: switch.turn_off
                     target:
                       entity_id: switch.nissan_charge
+                  - *charger_settle
               - *transaction_guard
               - if: "{{ not is_state('select.nissan_charge_charging_mode', 'immediate') }}"
                 then:
@@ -499,6 +544,7 @@ scripts:
                       entity_id: select.nissan_charge_charging_mode
                     data:
                       option: immediate
+                  - *charger_settle
               - *transaction_guard
               - if: "{{ states('number.nissan_charge_delay')|int(-1) != 0 }}"
                 then:
@@ -507,12 +553,14 @@ scripts:
                       entity_id: number.nissan_charge_delay
                     data:
                       value: 0
+                  - *charger_settle
               - *transaction_guard
               - if: "{{ not is_state('switch.nissan_charge', 'off') }}"
                 then:
                   - action: switch.turn_off
                     target:
                       entity_id: switch.nissan_charge
+                  - *charger_settle
           - conditions: "{{ operation in ['arm', 'charge'] }}"
             sequence:
               - if: "{{ operation == 'arm' }}"
@@ -523,6 +571,7 @@ scripts:
                   - action: switch.turn_off
                     target:
                       entity_id: switch.nissan_charge
+                  - *charger_settle
               - *transaction_guard
               - if: "{{ not is_state('select.nissan_charge_charging_mode', 'immediate') }}"
                 then:
@@ -531,6 +580,7 @@ scripts:
                       entity_id: select.nissan_charge_charging_mode
                     data:
                       option: immediate
+                  - *charger_settle
               - *transaction_guard
               - if: "{{ states('number.nissan_charge_delay')|int(-1) != hours }}"
                 then:
@@ -539,6 +589,7 @@ scripts:
                       entity_id: number.nissan_charge_delay
                     data:
                       value: '{{ hours }}'
+                  - *charger_settle
               - *transaction_guard
               - if: "{{ operation == 'arm' }}"
                 then:
@@ -547,15 +598,14 @@ scripts:
                       entity_id: select.nissan_charge_charging_mode
                     data:
                       option: delayed_charge
+                  - *charger_settle
               - wait_template: >-
                   {{ is_state('select.nissan_charge_charging_mode',
                        'delayed_charge' if operation == 'arm' else 'immediate')
                      and states('number.nissan_charge_delay')|int(-1) == hours }}
-                timeout: '00:00:30'
+                timeout: '00:05:00'
                 continue_on_timeout: true
               - *transaction_guard
-              - if: '{{ not wait.completed }}'
-                then: *stop_transaction
               - if: '{{ not wait.completed }}'
                 then:
                   - variables:
@@ -572,10 +622,29 @@ scripts:
                   - action: switch.turn_on
                     target:
                       entity_id: switch.nissan_charge
+                  - *charger_settle
+              - variables:
+                  startup_verify: "{{ operation == 'charge' }}"
+              - *transaction_guard
               - if: "{{ operation == 'arm' }}"
                 then:
+                  - wait_template: >-
+                      {{ is_number(states('sensor.nissan_charge_power'))
+                         and states('sensor.nissan_charge_power')|float(1) <= 0.05
+                         and states('sensor.nissan_charge_status') in ['available', 'waiting', 'plugged_in'] }}
+                    timeout: '00:20:00'
+                    continue_on_timeout: true
+                  - *transaction_guard
+                  - if: '{{ not wait.completed }}'
+                    then:
+                      - variables:
+                          result:
+                            ok: false
+                            superseded: false
+                      - stop: Timer idle feedback could not be verified
+                        response_variable: result
                   - repeat:
-                      count: 10
+                      count: 40
                       sequence:
                         - delay:
                             seconds: 1
@@ -587,8 +656,6 @@ scripts:
                                  and is_number(states('sensor.nissan_charge_power'))
                                  and states('sensor.nissan_charge_power')|float(1) <= 0.05
                                  and states('sensor.nissan_charge_status') in ['available', 'waiting', 'plugged_in'] }}
-                        - if: '{{ not stable }}'
-                          then: *stop_transaction
                         - if: >-
                             {{ not stable }}
                           then:
@@ -596,7 +663,7 @@ scripts:
                                 result:
                                   ok: false
                                   superseded: false
-                            - stop: Timer feedback was not stable for ten seconds
+                            - stop: Timer feedback was not stable for forty seconds
                               response_variable: result
                   - variables:
                       result:
@@ -608,14 +675,9 @@ scripts:
                   - wait_template: >-
                       {{ states('sensor.nissan_charge_power')|float(0) > 0.05
                          or is_state('sensor.nissan_charge_status', 'charging') }}
-                    timeout: '00:05:00'
+                    timeout: '00:20:00'
                     continue_on_timeout: true
                   - *transaction_guard
-                  - if: '{{ not wait.completed }}'
-                    then:
-                      - action: switch.turn_off
-                        target:
-                          entity_id: switch.nissan_charge
                   - variables:
                       result:
                         ok: '{{ wait.completed }}'
@@ -764,7 +826,17 @@ scripts:
                 if request in ['Immediate to 80%', 'Immediate to 100%']
                 else plan_json|from_json }}
           timer_plan_json: *timer_plan
-          plan: '{{ timer_plan_json|from_json }}'
+          plan: >-
+            {% set candidate = timer_plan_json|from_json %}
+            {% if request in ['Automatic', 'Night to 100%'] and already_charging
+                and fresh and soc_valid and not candidate.get('x', false)
+                and candidate.get('m') == 'continuous' and candidate.get('v') == 3
+                and candidate.get('c', false) and candidate.get('s', 0) <= now_ts < candidate.get('e', 0)
+                and 0 < candidate.get('s', 0) <= candidate.get('a', 0) < candidate.get('z', 0) <= candidate.get('e', 0) %}
+              {{ dict(candidate, x=true) }}
+            {% else %}
+              {{ candidate }}
+            {% endif %}
           timer_armed: >-
             {{ plan.get('x', false) and not plan.get('k', false) and not plan.get('l', false)
               and ((now_ts < plan.get('a', 0) + 300
@@ -885,12 +957,17 @@ scripts:
                     target:
                       entity_id: input_text.leaf_charging_status
                     data:
-                      value: Charger verification failed; recovery pending
+                      value: Charger state unverified; check charger
                   - action: input_text.set_value
                     target:
                       entity_id: input_text.leaf_next_charge_start
                     data:
-                      value: Recovery pending
+                      value: Charger state unverified; check charger
+                  - action: persistent_notification.create
+                    data:
+                      notification_id: leaf_charging_unverified
+                      title: Leaf charger state unverified
+                      message: The charger settings could not be verified. Check the charger; charging may not start as planned.
               - action: homeassistant.save_persistent_states
           - conditions: "{{ decision.get('recover', false) and not decision.get('failed', false) }}"
             sequence:
@@ -1225,15 +1302,9 @@ automations:
           scheduled_finish: *scheduled_finish
       - if: >-
            {{ trigger.id|default('manual') in ['settings', 'critical']
-             or not 8 <= states('number.nissan_charge_charge_current')|float(0) <= 16
-             or ((is_state('script.leaf_charger_write', 'on')
-                 or states('sensor.nissan_charge_power')|float(0) > 0.05)
-                and (not is_number(states('sensor.leaf_battery_level'))
-                   or (not -120 <= as_timestamp(now())
-                       - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600
-                     and not as_timestamp(now()) < scheduled_finish)))
              or (scheduled_finish > 0 and as_timestamp(now()) >= scheduled_finish)
              or (trigger.id|default('manual') == 'battery'
+               and -120 <= as_timestamp(now()) - as_timestamp(states('sensor.leaf_last_updated'), 0) <= 600
                 and states('sensor.leaf_battery_level')|float(-1)
                   >= (100 if states('input_select.leaf_charging_request') in
                       ['Night to 100%', 'Immediate to 100%'] else 80)) }}

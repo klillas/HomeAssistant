@@ -48,11 +48,11 @@ Changing a charging program does not implicitly stop preheat.
 - If the overnight price forecast is incomplete, the planner instead schedules a
   continuous block to finish the estimated target by 07:00, starting as early as
   the charger timer permits within the night window if it cannot fit. This fallback
-  does not bypass the battery freshness, fault, connection, or charger-control guards.
+  does not bypass the checks used before issuing new charging commands.
 - Below 20%, an early top-up is allowed only when the current price is strictly
   below the adjustable early-charge cap. The initial setting used here is 50 c/kWh.
-- Immediate requests ignore prices but retain the availability, fault, SOC,
-  freshness, and configured-current checks.
+- Immediate requests ignore prices. New commands still require valid charger and
+  battery data; an existing charge is preserved when that data becomes uncertain.
 - Duration is estimated from a configurable percentage-points/hour rate; 8 is the
   initial estimate used here. It is not a measurement of this particular car's
   charge curve or a guarantee of reaching the target by 07:00.
@@ -65,6 +65,11 @@ whole-hour start when the target still fits; otherwise it can start earlier to
 prioritize the target. The displayed start uses the acknowledged arming time, so
 03:01 rather than an exact market quarter can be expected.
 
+When the car is independently confirmed disconnected and the charger is idle,
+the idle safeguard can restore the 12-hour delay even if its reported value is
+unknown. An unavailable delay entity, active charging, or an unconfirmed
+disconnect still prevents this maintenance.
+
 ## Architecture and Limits
 
 Charger commands use **local Tuya LAN control**, not Tuya cloud control. Nissan SOC,
@@ -76,21 +81,17 @@ using Nissan's reported battery level. If HA, the network, or battery updates fa
 an armed charger can start autonomously and may continue toward 100%. The car's
 own BMS remains the final authority; do not treat HA as an electrical safety device.
 
-Before issuing charging commands the controller checks charger fault data, control
-availability, configured current within 8-16 A, SOC range, and battery-report age.
-The normal battery freshness limit is 10 minutes, with a two-minute clock-skew allowance.
-An existing complete overnight plan for the same program, target, and request
-generation may continue or start using its saved estimate when Nissan battery
-data becomes stale. Its saved finish time remains fixed, including during bounded
-timer recovery. HA stops the charger at that deadline even without a fresh battery
-report; the deadline is checked every minute. Without a valid saved overnight plan,
-fresh data is still required. Immediate programs do not use this exception.
-Fresh data reaching the target, a fault, disable, or confirmed disconnect still
-stops charging. The estimate can undercharge or exceed the requested SOC because
-it is not a measurement of the car's current battery level.
-Startup handover has a separate five-minute grace because mode/switch and pilot/
-power reports do not arrive simultaneously. That grace does not bypass the other
-charging guards or extend the saved finish time.
+Before issuing new charging commands the controller checks charger fault data,
+control availability, configured current within 8-16 A, SOC range, and battery age.
+The battery freshness limit is 10 minutes, with a two-minute clock-skew allowance.
+Once charging or a timer is established, missing, stale, or contradictory vehicle
+or charger feedback does not cause HA to send a stop command. A fresh SOC at the
+target, an explicitly reported charger fault, an estimated overnight finish, or
+an explicit disable still stops it. A saved overnight finish is fixed and checked
+every minute, even without fresh data. If no valid finish is available, including
+for Immediate charging, it can continue until fresh SOC reaches the target or the
+user stops it. The estimate can undercharge or exceed the requested SOC because it
+is not a measurement of the car's current battery level.
 
 ### Request Coordination and Recovery
 
@@ -98,21 +99,35 @@ All charger writes, including reset and idle maintenance, pass through one
 transaction script. New program requests invalidate older work; request timestamps
 also detect a change away from and back to the same selection. Ordinary feedback
 does not queue additional controller runs. Normal requests settle for two seconds,
-while disable, fault, target, and invalid active-charge safety data cancel current
-verification work promptly.
+while disable, fault, fresh target, and estimated finish cancel current verification
+work promptly. Charger commands within a transaction are separated by at least
+30 seconds; urgent safety stops are not delayed by a previous transaction.
 
-Arming requires ten seconds of consistent mode/delay/idle feedback after enabling
-the timer. The displayed start uses the enable-command time, not the end of that
-verification period. Failed acknowledgement clears the timer settings. Immediate
-startup verification waits up to five minutes for reported charging activity.
+When a future night program conflicts with a reported immediate charge, HA changes
+to the night timer only if connection, fault, controls, fresh battery data, charging
+status, and a recent positive power change agree. It sends stop first, waits, then
+programs the timer. It does not require zero power before proceeding, because
+charger feedback may be delayed. Uncertain or contradictory data preserves the
+existing charge, and an established timer is not reprogrammed by this check.
 
-An unexpectedly lost timer or failed start permits at most two recovery attempts
-for the same program, with a 60-second retry cooldown. Timer recovery stays within
-the original night window and respects the charger's integer-hour constraint;
-its replacement start can differ from the original start. Recovery exhaustion
-stops the charger and creates a persistent HA notification. An intentional stop,
-target completion, fault, disable, or confirmed disconnect does not use this retry
-path. Select the required program again to resume a stopped request.
+HA allows up to five minutes for mode and delay feedback. After enabling the
+timer, it allows up to twenty minutes for idle feedback and then
+requires forty seconds of consistent mode/delay/idle feedback. The displayed start
+uses the enable-command time, not the end of that verification period. This
+interval catches some late reversions but does not prove
+the charger independently confirmed its settings: Tuya Local may expose pending or
+cached values. Verify fresh device feedback before relying on an armed timer. If
+acknowledgement fails, HA leaves the charger settings alone and raises a persistent
+notification. Immediate startup verification waits up to twenty minutes for
+reported activity; a timeout does not
+switch the charger off.
+
+HA preserves an established timer or charge when feedback becomes uncertain rather
+than stopping it to retry. This avoids interrupting a charge but cannot guarantee
+that a charger which actually failed to start will recover automatically. Check the
+reported power or charger status to confirm charging activity. If the charger
+reports charging before an unarmed night plan but the transition checks cannot be
+confirmed, the status warns that the schedule is not enforced.
 
 The next-start display distinguishes stopped, recovering, and failed requests.
 It shows Charging only with reported power/activity, not merely a passed timestamp.
